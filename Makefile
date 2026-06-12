@@ -27,6 +27,12 @@ docker-down: ## Stop all Docker services
 docker-setup: ## Docker: pull model and create translator
 	docker compose up setup
 
+batch: ## Batch translate: make batch INPUT=doc.txt TARGET=ja WORKERS=8
+	python batch_pipeline.py $(INPUT) --target $(TARGET) --workers $(or $(WORKERS),8)
+
+batch-dir: ## Batch translate dir: make batch-dir INPUT=docs/ TARGET=ja OUTPUT=out/
+	python batch_pipeline.py $(INPUT) --target $(TARGET) --output $(or $(OUTPUT),translated/) --workers $(or $(WORKERS),8)
+
 test: ## Quick smoke test
 	@echo "==> Testing CLI..."
 	@./translate.sh ja "Hello" && echo ""
