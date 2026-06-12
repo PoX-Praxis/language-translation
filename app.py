@@ -55,10 +55,18 @@ BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
 
 ENGINE_GOOGLE = "Google Translate"
+ENGINE_DEEPL = "DeepL"
 ENGINE_OLLAMA = "Ollama (Local LLM)"
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "translator"
+
+DEEPL_LANG_MAP = {
+    "ja": "JA", "en": "EN", "zh-cn": "ZH", "ko": "KO",
+    "fr": "FR", "de": "DE", "es": "ES", "pt": "PT-BR",
+    "ru": "RU", "ar": "AR", "hi": "HI", "it": "IT",
+    "nl": "NL", "tr": "TR", "vi": "VI", "th": "TH",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +108,33 @@ class GoogleTranslateEngine:
         translated = "\n".join(r[0] for r in results)
         src_lang = results[0][1]
         return translated, src_lang
+
+
+class DeepLEngine:
+    _FREE_URL = "https://api-free.deepl.com/v2/translate"
+    _PRO_URL = "https://api.deepl.com/v2/translate"
+
+    def __init__(self, api_key=""):
+        self.api_key = api_key
+
+    def translate(self, text, target_code):
+        if not self.api_key:
+            raise RuntimeError("DeepL API key is not set")
+        deepl_code = DEEPL_LANG_MAP.get(target_code, target_code.upper())
+        is_free = self.api_key.endswith(":fx")
+        url = self._FREE_URL if is_free else self._PRO_URL
+        data = urllib.parse.urlencode({
+            "text": text,
+            "target_lang": deepl_code,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Authorization": f"DeepL-Auth-Key {self.api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        tr = body["translations"][0]
+        return tr["text"], tr.get("detected_source_language", "auto").lower()
 
 
 class OllamaEngine:
@@ -527,6 +562,7 @@ class TranslationApp(tk.Tk):
         self.attributes("-topmost", True)
 
         self._google_engine = GoogleTranslateEngine()
+        self._deepl_engine = DeepLEngine()
         self._ollama_engine = None
 
         self.running = False
@@ -552,15 +588,35 @@ class TranslationApp(tk.Tk):
         self.engine_var = tk.StringVar(value=ENGINE_GOOGLE)
         engine_combo = ttk.Combobox(
             engine_frame, textvariable=self.engine_var,
-            values=[ENGINE_GOOGLE, ENGINE_OLLAMA],
+            values=[ENGINE_GOOGLE, ENGINE_DEEPL, ENGINE_OLLAMA],
             state="readonly", width=22,
         )
         engine_combo.grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
         engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
 
+        self.deepl_frame = ttk.Frame(engine_frame)
+        self.deepl_frame.grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
+        )
+        ttk.Label(self.deepl_frame, text="API Key:").grid(
+            row=0, column=0, sticky=tk.W,
+        )
+        self.deepl_key_var = tk.StringVar()
+        deepl_entry = ttk.Entry(
+            self.deepl_frame, textvariable=self.deepl_key_var,
+            width=32, show="*",
+        )
+        deepl_entry.grid(row=0, column=1, padx=5)
+        ttk.Label(
+            self.deepl_frame,
+            text="Free API: https://www.deepl.com/pro-api",
+            foreground="gray",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W)
+        self.deepl_frame.grid_remove()
+
         self.ollama_frame = ttk.Frame(engine_frame)
         self.ollama_frame.grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
+            row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
         )
 
         ttk.Label(self.ollama_frame, text="URL:").grid(
@@ -652,12 +708,17 @@ class TranslationApp(tk.Tk):
     # --- Engine management ---
 
     def _on_engine_change(self, event=None):
-        if self.engine_var.get() == ENGINE_OLLAMA:
+        engine = self.engine_var.get()
+        self.deepl_frame.grid_remove()
+        self.ollama_frame.grid_remove()
+        if engine == ENGINE_DEEPL:
+            self.deepl_frame.grid()
+            self.geometry("450x360")
+        elif engine == ENGINE_OLLAMA:
             self.ollama_frame.grid()
             self.geometry("450x420")
             self._check_ollama_status()
         else:
-            self.ollama_frame.grid_remove()
             self.geometry("450x320")
 
     def _check_ollama_status(self):
@@ -702,7 +763,11 @@ class TranslationApp(tk.Tk):
         threading.Thread(target=_do, daemon=True).start()
 
     def _get_engine(self):
-        if self.engine_var.get() == ENGINE_OLLAMA:
+        engine = self.engine_var.get()
+        if engine == ENGINE_DEEPL:
+            self._deepl_engine.api_key = self.deepl_key_var.get().strip()
+            return self._deepl_engine
+        if engine == ENGINE_OLLAMA:
             url = self.ollama_url_var.get()
             model = self.ollama_model_var.get()
             if self._ollama_engine is None or \
