@@ -453,6 +453,7 @@ def _extract_text_blocks(gray_img):
                 "y2": data["top"][i] + data["height"][i],
                 "words": [],
                 "lines": {},
+                "word_heights": [],
             }
         b = blocks[block_id]
         b["x"] = min(b["x"], data["left"][i])
@@ -460,6 +461,7 @@ def _extract_text_blocks(gray_img):
         b["x2"] = max(b["x2"], data["left"][i] + data["width"][i])
         b["y2"] = max(b["y2"], data["top"][i] + data["height"][i])
         b["words"].append(text)
+        b["word_heights"].append(data["height"][i])
         line_id = data["line_num"][i]
         if line_id not in b["lines"]:
             b["lines"][line_id] = []
@@ -475,6 +477,7 @@ def _extract_text_blocks(gray_img):
         full_text = _join_hard_wraps("\n".join(line_texts))
         if not full_text.strip():
             continue
+        avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
         pad_x = 6
         pad_y = 4
         result.append({
@@ -483,6 +486,7 @@ def _extract_text_blocks(gray_img):
             "w": b["x2"] - b["x"] + pad_x * 2,
             "h": b["y2"] - b["y"] + pad_y * 2,
             "text": full_text,
+            "median_char_h": avg_h,
         })
     return result
 
@@ -507,32 +511,85 @@ def _wrap_text(text, font, max_w, draw):
     return lines
 
 
+def _classify_blocks(blocks):
+    if not blocks:
+        return {}
+    heights = [b["median_char_h"] for b in blocks]
+    body_h = int(np.median(heights))
+    sizes = {}
+    for i, b in enumerate(blocks):
+        diff = b["median_char_h"] - body_h
+        if diff > body_h * 0.15:
+            sizes[i] = 1
+        elif diff < -body_h * 0.15:
+            sizes[i] = -1
+        else:
+            sizes[i] = 0
+    return sizes
+
+
 def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
-    font = _find_system_font(font_size)
-    line_spacing = int(font_size * 0.35)
+    iw, ih = img.size
 
-    for block, translated in zip(blocks, translations):
+    size_classes = _classify_blocks(blocks)
+
+    block_renders = []
+    for i, (block, translated) in enumerate(zip(blocks, translations)):
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-        bg_color, fg_color = _region_colors(base_img, x, y, w, h)
-
-        draw.rectangle([x, y, x + w, y + h], fill=bg_color)
+        offset = size_classes.get(i, 0)
+        fs = font_size + offset
+        font = _find_system_font(fs)
+        line_spacing = int(fs * 0.35)
 
         margin = 4
         max_w = w - margin * 2
         wrapped = _wrap_text(translated, font, max_w, draw)
 
-        dy = y + margin
+        total_h = margin * 2
         for line in wrapped:
             if not line:
-                dy += font_size // 2
+                total_h += fs // 2
+            else:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                total_h += bbox[3] - bbox[1] + line_spacing
+
+        render_h = max(h, total_h)
+
+        block_renders.append({
+            "x": x, "y": y, "w": w, "h": render_h,
+            "wrapped": wrapped, "font": font, "fs": fs,
+            "line_spacing": line_spacing, "margin": margin,
+        })
+
+    for i in range(len(block_renders) - 1):
+        cur = block_renders[i]
+        nxt = block_renders[i + 1]
+        cur_bottom = cur["y"] + cur["h"]
+        if cur_bottom > nxt["y"]:
+            shift = cur_bottom - nxt["y"] + 4
+            for j in range(i + 1, len(block_renders)):
+                block_renders[j]["y"] += shift
+
+    for i, br in enumerate(block_renders):
+        x, y, w, h = br["x"], br["y"], br["w"], br["h"]
+        orig_block = blocks[i]
+        ox, oy = orig_block["x"], orig_block["y"]
+        ow, oh = orig_block["w"], orig_block["h"]
+        bg_color, fg_color = _region_colors(base_img, ox, oy, ow, oh)
+
+        draw.rectangle([x, y, x + w, y + h], fill=bg_color)
+
+        margin = br["margin"]
+        dy = y + margin
+        for line in br["wrapped"]:
+            if not line:
+                dy += br["fs"] // 2
                 continue
-            bbox = draw.textbbox((0, 0), line, font=font)
-            line_h = bbox[3] - bbox[1] + line_spacing
-            if dy + line_h > y + h:
-                break
-            draw.text((x + margin, dy), line, fill=fg_color, font=font)
+            bbox = draw.textbbox((0, 0), line, font=br["font"])
+            line_h = bbox[3] - bbox[1] + br["line_spacing"]
+            draw.text((x + margin, dy), line, fill=fg_color, font=br["font"])
             dy += line_h
 
     return img
