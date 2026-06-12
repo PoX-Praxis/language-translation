@@ -57,7 +57,7 @@ ENGINE_GOOGLE = "Google Translate"
 ENGINE_OLLAMA = "Ollama (Local LLM)"
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "gemma3:1b"
+DEFAULT_OLLAMA_MODEL = "translator"
 
 
 # ---------------------------------------------------------------------------
@@ -75,89 +75,83 @@ class GoogleTranslateEngine:
 
 
 class OllamaEngine:
+    “””Uses /api/generate with a custom Modelfile-based model for speed.”””
+
+    GENERATE_OPTIONS = {
+        “temperature”: 0.1,
+        “top_p”: 0.9,
+        “top_k”: 20,
+        “num_predict”: 512,
+        “num_ctx”: 1024,
+    }
+
     def __init__(self, base_url=DEFAULT_OLLAMA_URL, model=DEFAULT_OLLAMA_MODEL):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip(“/”)
         self.model = model
         self._status_cb = None
 
     def set_status_callback(self, cb):
         self._status_cb = cb
 
-    def _report(self, msg, color="blue"):
+    def _report(self, msg, color=”blue”):
         if self._status_cb:
             self._status_cb(msg, color)
+
+    def _post(self, endpoint, payload_dict):
+        data = json.dumps(payload_dict).encode(“utf-8”)
+        req = urllib.request.Request(
+            f”{self.base_url}{endpoint}”,
+            data=data,
+            headers={“Content-Type”: “application/json”},
+        )
+        return urllib.request.urlopen(req, timeout=300)
 
     @staticmethod
     def _clean_output(text):
         text = text.strip()
         quote_pairs = [
-            ('"""', '"""'), ("'''", "'''"), ('``', "''"),
-            ("“", "”"), ("「", "」"),
-            ("『", "』"), ('"', '"'), ("'", "'"),
+            ('”””', '”””'), (“'''”, “'''”), ('``', “''”),
+            (““”, “””), (“「”, “」”),
+            (“『”, “』”), ('”', '”'), (“'”, “'”),
         ]
         for open_q, close_q in quote_pairs:
             if text.startswith(open_q) and text.endswith(close_q):
                 text = text[len(open_q):-len(close_q)].strip()
                 break
-        lines = text.split("\n")
+        lines = text.split(“\n”)
         cleaned = []
         for line in lines:
             low = line.strip().lower()
-            if low.startswith("translation:") or low.startswith("here is"):
+            if low.startswith(“translation:”) or low.startswith(“here is”):
                 continue
-            if low.startswith("note:") or low.startswith("---"):
+            if low.startswith(“note:”) or low.startswith(“---”):
                 break
-            if low.startswith("```"):
+            if low.startswith(“```”):
                 continue
             cleaned.append(line)
-        return "\n".join(cleaned).strip()
-
-    def _ollama_request(self, payload_dict, stream=True):
-        data = json.dumps(payload_dict).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/api/chat",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        return urllib.request.urlopen(req, timeout=300)
+        return “\n”.join(cleaned).strip()
 
     def translate(self, text, target_code):
         target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"You are a professional translator. "
-                    f"Translate the user's text into {target_name}. "
-                    f"Output the translated text only. "
-                    f"Do not include any explanations, notes, "
-                    f"quotation marks, or markdown formatting."
-                ),
-            },
-            {
-                "role": "user",
-                "content": text,
-            },
-        ]
+        prompt = (
+            f”Translate to {target_name}. “
+            f”Output only the translation:\n\n{text}”
+        )
 
         payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "temperature": 0.1,
-                "num_predict": 1024,
-            },
+            “model”: self.model,
+            “prompt”: prompt,
+            “stream”: True,
+            “options”: self.GENERATE_OPTIONS,
         }
 
-        self._report("Ollama: translating...")
+        self._report(“Ollama: translating...”)
 
         try:
-            resp = self._ollama_request(payload)
+            resp = self._post(“/api/generate”, payload)
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
+            body = e.read().decode(“utf-8”, errors=”replace”)
+            raise RuntimeError(f”Ollama HTTP {e.code}: {body}”) from e
 
         try:
             chunks = []
@@ -166,70 +160,69 @@ class OllamaEngine:
                 if not raw_line:
                     continue
                 try:
-                    obj = json.loads(raw_line.decode("utf-8"))
+                    obj = json.loads(raw_line.decode(“utf-8”))
                 except json.JSONDecodeError:
                     continue
-                if "error" in obj:
-                    raise RuntimeError(f"Ollama error: {obj['error']}")
-                msg = obj.get("message", {})
-                token = msg.get("content", "")
+                if “error” in obj:
+                    raise RuntimeError(f”Ollama: {obj['error']}”)
+                token = obj.get(“response”, “”)
                 if token:
                     chunks.append(token)
-                    preview = "".join(chunks)
+                    preview = “”.join(chunks)
                     if len(preview) > 40:
-                        preview = "..." + preview[-40:]
-                    self._report(f"Ollama: {preview}")
-                if obj.get("done", False):
+                        preview = “...” + preview[-40:]
+                    self._report(f”Ollama: {preview}”)
+                if obj.get(“done”, False):
                     break
         finally:
             resp.close()
 
-        raw = "".join(chunks)
+        raw = “”.join(chunks)
         if not raw.strip():
-            raise RuntimeError("Ollama returned empty response")
+            raise RuntimeError(“Ollama returned empty response”)
 
         translated = self._clean_output(raw)
-        return translated, "auto"
+        return translated, “auto”
 
     def warmup(self):
         try:
-            self._report(f"Loading {self.model} into memory...")
+            self._report(f”Loading {self.model} into memory...”)
             payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-                "options": {"num_predict": 1},
+                “model”: self.model,
+                “prompt”: “Hi”,
+                “stream”: False,
+                “options”: {“num_predict”: 1},
             }
-            resp = self._ollama_request(payload, stream=False)
+            resp = self._post(“/api/generate”, payload)
             resp.read()
             resp.close()
-            self._report(f"{self.model} loaded and ready", "green")
+            self._report(f”{self.model} loaded and ready”, “green”)
             return True
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            self._report(f"Warmup failed: HTTP {e.code} - {body}", "red")
+            body = e.read().decode(“utf-8”, errors=”replace”)
+            self._report(f”Warmup failed: HTTP {e.code} - {body}”, “red”)
             return False
         except Exception as e:
-            self._report(f"Warmup failed: {e}", "red")
+            self._report(f”Warmup failed: {e}”, “red”)
             return False
 
     @staticmethod
     def list_models(base_url=DEFAULT_OLLAMA_URL):
         try:
             req = urllib.request.Request(
-                f"{base_url.rstrip('/')}/api/tags",
-                headers={"Content-Type": "application/json"},
+                f”{base_url.rstrip('/')}/api/tags”,
+                headers={“Content-Type”: “application/json”},
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            return [m["name"] for m in body.get("models", [])]
+                body = json.loads(resp.read().decode(“utf-8”))
+            return [m[“name”] for m in body.get(“models”, [])]
         except Exception:
             return []
 
     @staticmethod
     def is_available(base_url=DEFAULT_OLLAMA_URL):
         try:
-            req = urllib.request.Request(f"{base_url.rstrip('/')}/api/tags")
+            req = urllib.request.Request(f”{base_url.rstrip('/')}/api/tags”)
             with urllib.request.urlopen(req, timeout=3) as resp:
                 return resp.status == 200
         except Exception:
