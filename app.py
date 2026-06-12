@@ -95,6 +95,11 @@ def _text_color_for_bg(bg_rgb):
     return (30, 30, 30) if luminance > 128 else (230, 230, 230)
 
 
+def _first_word(text):
+    words = text.split()
+    return words[0] if words else ""
+
+
 class CaptureFrame(tk.Toplevel):
     """Transparent movable/resizable capture frame with gray border."""
 
