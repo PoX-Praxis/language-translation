@@ -566,10 +566,7 @@ def _render_inplace(base_img, blocks, translations, font_size):
                 continue
             bbox = draw.textbbox((0, 0), line, font=font)
             line_h = bbox[3] - bbox[1] + line_spacing
-            draw.text(
-                (x + margin, dy), line, fill=fg_color, font=font,
-                stroke_width=1, stroke_fill=fg_color,
-            )
+            draw.text((x + margin, dy), line, fill=fg_color, font=font)
             dy += line_h
 
     return img
