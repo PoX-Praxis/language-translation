@@ -12,14 +12,16 @@ import json
 import time
 from contextlib import asynccontextmanager
 
+import os
+
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-OLLAMA_URL = "http://localhost:11434"
-MODEL_NAME = "translator"
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+MODEL_NAME = os.environ.get("MODEL_NAME", "translator")
 
 http_client: httpx.AsyncClient | None = None
 
