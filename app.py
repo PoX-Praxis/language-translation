@@ -7,6 +7,7 @@ Screen Translation Overlay App
 - Auto-translates when text changes; click overlay to dismiss
 """
 
+import concurrent.futures
 import json
 import os
 import sys
@@ -67,7 +68,7 @@ DEFAULT_OLLAMA_MODEL = "translator"
 class GoogleTranslateEngine:
     _TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
-    def translate(self, text, target_code):
+    def _translate_one(self, text, target_code):
         params = urllib.parse.urlencode({
             "client": "gtx",
             "sl": "auto",
@@ -84,6 +85,20 @@ class GoogleTranslateEngine:
             data = json.loads(resp.read().decode("utf-8"))
         translated = "".join(seg[0] for seg in data[0] if seg[0])
         src_lang = data[2] if len(data) > 2 else "auto"
+        return translated, src_lang
+
+    def translate(self, text, target_code):
+        paragraphs = [p for p in text.split("\n") if p.strip()]
+        if len(paragraphs) <= 1:
+            return self._translate_one(text, target_code)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(self._translate_one, p, target_code)
+                for p in paragraphs
+            ]
+            results = [f.result() for f in futures]
+        translated = "\n".join(r[0] for r in results)
+        src_lang = results[0][1]
         return translated, src_lang
 
 
@@ -761,7 +776,16 @@ class TranslationApp(tk.Tk):
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
             )
 
-            raw_text = pytesseract.image_to_string(img).strip()
+            gray = img.convert("L")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                ocr_future = pool.submit(
+                    pytesseract.image_to_string, gray,
+                )
+                bg_future = pool.submit(_dominant_color, img)
+
+                raw_text = ocr_future.result().strip()
+                bg_color = bg_future.result()
+
             if not raw_text:
                 self._set_status("No text detected in frame")
                 self._prev_first_word = None
@@ -777,7 +801,6 @@ class TranslationApp(tk.Tk):
 
             self._set_status(f"Translating: {ocr_text[:50]}...")
 
-            bg_color = _dominant_color(img)
             target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
 
             engine = self._get_engine()
