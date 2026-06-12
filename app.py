@@ -78,6 +78,14 @@ class OllamaEngine:
     def __init__(self, base_url=DEFAULT_OLLAMA_URL, model=DEFAULT_OLLAMA_MODEL):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self._status_cb = None
+
+    def set_status_callback(self, cb):
+        self._status_cb = cb
+
+    def _report(self, msg, color="blue"):
+        if self._status_cb:
+            self._status_cb(msg, color)
 
     def translate(self, text, target_code):
         target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
@@ -91,7 +99,7 @@ class OllamaEngine:
         payload = json.dumps({
             "model": self.model,
             "prompt": prompt,
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": 0.1,
             },
@@ -103,11 +111,54 @@ class OllamaEngine:
             headers={"Content-Type": "application/json"},
         )
 
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        self._report("Ollama: generating...")
 
-        translated = body.get("response", "").strip()
+        # Stream response to avoid timeout
+        resp = urllib.request.urlopen(req, timeout=300)
+        try:
+            chunks = []
+            for line in resp:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line.decode("utf-8"))
+                token = obj.get("response", "")
+                if token:
+                    chunks.append(token)
+                    preview = "".join(chunks)
+                    if len(preview) > 30:
+                        preview = "..." + preview[-30:]
+                    self._report(f"Ollama: {preview}")
+                if obj.get("done", False):
+                    break
+        finally:
+            resp.close()
+
+        translated = "".join(chunks).strip()
         return translated, "auto"
+
+    def warmup(self):
+        """Send a short request to pre-load the model into memory."""
+        try:
+            self._report("Loading model into memory...")
+            payload = json.dumps({
+                "model": self.model,
+                "prompt": "Hi",
+                "stream": False,
+                "options": {"num_predict": 1},
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                resp.read()
+            self._report("Model loaded and ready", "green")
+            return True
+        except Exception as e:
+            self._report(f"Warmup failed: {e}", "red")
+            return False
 
     @staticmethod
     def list_models(base_url=DEFAULT_OLLAMA_URL):
@@ -465,6 +516,12 @@ class TranslationApp(tk.Tk):
         )
         self.ollama_status.grid(row=2, column=0, columnspan=3, sticky=tk.W)
 
+        self.warmup_btn = ttk.Button(
+            self.ollama_frame, text="Load Model",
+            command=self._warmup_model,
+        )
+        self.warmup_btn.grid(row=0, column=2, padx=2)
+
         self.ollama_frame.grid_remove()
 
         # --- Translation settings ---
@@ -557,6 +614,17 @@ class TranslationApp(tk.Tk):
         self.ollama_status.config(text="Checking...", foreground="gray")
         self._check_ollama_status()
 
+    def _warmup_model(self):
+        self.warmup_btn.config(state=tk.DISABLED)
+        self._set_status("Loading model into memory...")
+
+        def _do():
+            engine = self._get_engine()
+            if isinstance(engine, OllamaEngine):
+                engine.warmup()
+            self.after(0, lambda: self.warmup_btn.config(state=tk.NORMAL))
+        threading.Thread(target=_do, daemon=True).start()
+
     def _get_engine(self):
         if self.engine_var.get() == ENGINE_OLLAMA:
             url = self.ollama_url_var.get()
@@ -565,6 +633,7 @@ class TranslationApp(tk.Tk):
                self._ollama_engine.base_url != url.rstrip("/") or \
                self._ollama_engine.model != model:
                 self._ollama_engine = OllamaEngine(url, model)
+                self._ollama_engine.set_status_callback(self._set_status)
             return self._ollama_engine
         return self._google_engine
 
