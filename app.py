@@ -1,8 +1,7 @@
 """
 Screen Translation Overlay App
 - Captures text within a movable/resizable overlay frame
-- Detects the source language and translates to a selected target language
-- Displays translated text directly inside the capture frame
+- Control toolbar attached to top-right of the frame
 - Uses DeepL API for high-quality translation
 - Auto-translates when text changes; click overlay to dismiss
 """
@@ -52,6 +51,7 @@ LANG_NAMES_NATIVE = {v: k for k, v in LANG_OPTIONS.items()}
 
 BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
+TOOLBAR_HEIGHT = 28
 
 DEFAULT_DEEPL_KEY = "d4ba5dbe-ef4e-4735-bca2-3268722e0ecb:fx"
 
@@ -195,6 +195,7 @@ class CaptureFrame(tk.Toplevel):
         self._drag_data = {"x": 0, "y": 0}
         self._resize_data = {"x": 0, "y": 0, "w": 0, "h": 0}
         self._zone = "none"
+        self._on_move = None
 
         self.canvas = tk.Canvas(self, bg="#010101", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -202,6 +203,10 @@ class CaptureFrame(tk.Toplevel):
         self.canvas.bind("<Configure>", self._draw_border)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+    def set_on_move(self, cb):
+        self._on_move = cb
 
     def _draw_border(self, event=None):
         self.canvas.delete("border")
@@ -242,12 +247,19 @@ class CaptureFrame(tk.Toplevel):
             x = event.x_root - self._drag_data["x"]
             y = event.y_root - self._drag_data["y"]
             self.geometry(f"+{x}+{y}")
+            if self._on_move:
+                self._on_move()
         elif self._zone == "resize":
             dx = event.x_root - self._resize_data["x"]
             dy = event.y_root - self._resize_data["y"]
             new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
             new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
             self.geometry(f"{new_w}x{new_h}")
+            if self._on_move:
+                self._on_move()
+
+    def _on_release(self, event):
+        self._zone = "none"
 
     def get_inner_region(self):
         self.update_idletasks()
@@ -302,6 +314,85 @@ class TranslationOverlay(tk.Toplevel):
         return self._visible
 
 
+class Toolbar(tk.Toplevel):
+    def __init__(self, master, on_toggle=None, on_translate=None):
+        super().__init__(master)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="#444444")
+
+        self._on_toggle = on_toggle
+        self._on_translate = on_translate
+
+        f = tk.Frame(self, bg="#444444")
+        f.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        self.lang_var = tk.StringVar(value="日本語")
+        lang_combo = ttk.Combobox(
+            f, textvariable=self.lang_var,
+            values=list(LANG_OPTIONS.keys()), state="readonly", width=8,
+            font=("", 8),
+        )
+        lang_combo.pack(side=tk.LEFT, padx=1)
+
+        self.fontsize_var = tk.StringVar(value="16")
+        fontsize_spin = tk.Spinbox(
+            f, from_=8, to=48, textvariable=self.fontsize_var,
+            width=3, font=("", 8), bg="#555555", fg="white",
+            buttonbackground="#666666",
+        )
+        fontsize_spin.pack(side=tk.LEFT, padx=1)
+
+        self.toggle_btn = tk.Button(
+            f, text="Start", command=self._do_toggle,
+            font=("", 8), bg="#228B22", fg="white",
+            activebackground="#1a6b1a", activeforeground="white",
+            relief=tk.FLAT, padx=6, pady=0,
+        )
+        self.toggle_btn.pack(side=tk.LEFT, padx=1)
+
+        self.translate_btn = tk.Button(
+            f, text="Translate", command=self._do_translate,
+            font=("", 8), bg="#4169E1", fg="white",
+            activebackground="#3155b8", activeforeground="white",
+            relief=tk.FLAT, padx=6, pady=0, state=tk.DISABLED,
+        )
+        self.translate_btn.pack(side=tk.LEFT, padx=1)
+
+        self.close_btn = tk.Button(
+            f, text="X", command=master.destroy,
+            font=("", 8, "bold"), bg="#CC3333", fg="white",
+            activebackground="#aa2222", activeforeground="white",
+            relief=tk.FLAT, padx=4, pady=0,
+        )
+        self.close_btn.pack(side=tk.LEFT, padx=1)
+
+    def _do_toggle(self):
+        if self._on_toggle:
+            self._on_toggle()
+
+    def _do_translate(self):
+        if self._on_translate:
+            self._on_translate()
+
+    def set_running(self, running):
+        if running:
+            self.toggle_btn.config(text="Stop", bg="#CC3333",
+                                   activebackground="#aa2222")
+            self.translate_btn.config(state=tk.NORMAL)
+        else:
+            self.toggle_btn.config(text="Start", bg="#228B22",
+                                   activebackground="#1a6b1a")
+            self.translate_btn.config(state=tk.DISABLED)
+
+    def position_at(self, frame_x, frame_y, frame_w):
+        self.update_idletasks()
+        tw = self.winfo_reqwidth()
+        x = frame_x + frame_w - tw
+        y = frame_y - TOOLBAR_HEIGHT - 2
+        self.geometry(f"+{x}+{y}")
+
+
 def _wrap_text(text, font, max_w, draw):
     lines = []
     for paragraph in text.split("\n"):
@@ -352,13 +443,10 @@ def _render_text_image(w, h, bg_color, fg_color, text, font_size):
 # Main application
 # ---------------------------------------------------------------------------
 
-class TranslationApp(tk.Tk):
+class ScreenTranslator(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Screen Translator")
-        self.geometry("380x250")
-        self.resizable(False, False)
-        self.attributes("-topmost", True)
+        self.withdraw()
 
         self._engine = DeepLEngine(DEFAULT_DEEPL_KEY)
 
@@ -368,88 +456,39 @@ class TranslationApp(tk.Tk):
         self._prev_translated = ""
         self._prev_bg_color = (255, 255, 255)
 
-        self._build_ui()
-
         self.capture_frame = CaptureFrame(self)
         self.overlay = TranslationOverlay(self, on_click=self._on_overlay_click)
+        self.toolbar = Toolbar(
+            self,
+            on_toggle=self._toggle,
+            on_translate=self._manual_translate,
+        )
+
+        self.capture_frame.set_on_move(self._reposition_toolbar)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _build_ui(self):
-        settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
-        settings_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
+        self.after(100, self._reposition_toolbar)
 
-        ttk.Label(settings_frame, text="Target Language:").grid(
-            row=0, column=0, sticky=tk.W, pady=2,
-        )
-        self.lang_var = tk.StringVar(value="日本語")
-        lang_combo = ttk.Combobox(
-            settings_frame, textvariable=self.lang_var,
-            values=list(LANG_OPTIONS.keys()), state="readonly", width=18,
-        )
-        lang_combo.grid(row=0, column=1, padx=5, pady=2)
-
-        ttk.Label(settings_frame, text="Font Size:").grid(
-            row=1, column=0, sticky=tk.W, pady=2,
-        )
-        self.fontsize_var = tk.StringVar(value="16")
-        fontsize_spin = ttk.Spinbox(
-            settings_frame, from_=8, to=48, textvariable=self.fontsize_var,
-            width=5,
-        )
-        fontsize_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
-
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        self.toggle_btn = ttk.Button(
-            btn_frame, text="▶  Start", command=self._toggle,
-        )
-        self.toggle_btn.pack(side=tk.LEFT, padx=5)
-
-        self.translate_btn = ttk.Button(
-            btn_frame, text="Translate", command=self._manual_translate,
-            state=tk.DISABLED,
-        )
-        self.translate_btn.pack(side=tk.LEFT, padx=5)
-
-        self.status_label = ttk.Label(
-            btn_frame, text="Stopped", foreground="gray",
-        )
-        self.status_label.pack(side=tk.LEFT, padx=10)
-
-        self.info_label = ttk.Label(
-            self, text="", foreground="blue", wraplength=360,
-        )
-        self.info_label.pack(fill=tk.X, padx=10, pady=(0, 5))
-
-    # --- Status ---
-
-    def _set_status(self, text, color="blue"):
-        self.after(
-            0, lambda t=text, c=color: self.info_label.config(
-                text=t, foreground=c,
-            ),
-        )
+    def _reposition_toolbar(self):
+        self.capture_frame.update_idletasks()
+        fx = self.capture_frame.winfo_x()
+        fy = self.capture_frame.winfo_y()
+        fw = self.capture_frame.winfo_width()
+        self.toolbar.position_at(fx, fy, fw)
 
     # --- Start / Stop ---
 
     def _toggle(self):
         if self.running:
             self.running = False
-            self.toggle_btn.config(text="▶  Start")
-            self.translate_btn.config(state=tk.DISABLED)
-            self.status_label.config(text="Stopped", foreground="gray")
+            self.toolbar.set_running(False)
             self.overlay.hide()
             self._prev_first_word = None
-            self._set_status("")
         else:
             self.running = True
             self._prev_first_word = None
-            self.toggle_btn.config(text="⏹  Stop")
-            self.translate_btn.config(state=tk.NORMAL)
-            self.status_label.config(text="Running", foreground="green")
-            self._set_status("Scanning...")
+            self.toolbar.set_running(True)
             self._poll()
 
     def _poll(self):
@@ -466,14 +505,12 @@ class TranslationApp(tk.Tk):
             return
         self.overlay.hide()
         self._prev_first_word = None
-        self._set_status("Translating...")
         threading.Thread(
             target=self._scan_and_translate, daemon=True,
         ).start()
 
     def _on_overlay_click(self):
         self._prev_first_word = None
-        self._set_status("Dismissed. Rescanning...")
 
     # --- Core translation ---
 
@@ -499,35 +536,30 @@ class TranslationApp(tk.Tk):
                 bg_color = bg_future.result()
 
             if not raw_text:
-                self._set_status("No text detected in frame")
                 self._prev_first_word = None
                 return
 
             ocr_text = _join_hard_wraps(raw_text)
-
             current_first = _first_word(ocr_text)
 
             if (self._prev_first_word is not None
                     and current_first == self._prev_first_word):
                 return
 
-            self._set_status(f"Translating: {ocr_text[:50]}...")
+            target_code = LANG_OPTIONS.get(
+                self.toolbar.lang_var.get(), "en",
+            )
 
-            target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
-
-            translated, src_lang = self._engine.translate(ocr_text, target_code)
+            translated, src_lang = self._engine.translate(
+                ocr_text, target_code,
+            )
 
             self._prev_first_word = current_first
             self._prev_translated = translated
             self._prev_bg_color = bg_color
 
-            target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
-            self._set_status(
-                f"[DeepL] [{src_lang}] → [{target_name}]",
-            )
-
             fg_color = _text_color_for_bg(bg_color)
-            font_size = int(self.fontsize_var.get())
+            font_size = int(self.toolbar.fontsize_var.get())
             w, h = region["width"], region["height"]
             text_img = _render_text_image(
                 w, h, bg_color, fg_color, translated, font_size,
@@ -538,16 +570,7 @@ class TranslationApp(tk.Tk):
                 self.overlay.show_at,
                 region["left"], region["top"], w, h, text_img,
             )
-        except urllib.error.URLError as e:
-            self._set_status(
-                f"Connection failed: {e.reason}", "red",
-            )
-            traceback.print_exc()
-        except RuntimeError as e:
-            self._set_status(f"Error: {e}", "red")
-            traceback.print_exc()
         except Exception as e:
-            self._set_status(f"Error: {type(e).__name__}: {e}", "red")
             traceback.print_exc()
         finally:
             self._lock.release()
@@ -556,11 +579,12 @@ class TranslationApp(tk.Tk):
         self.running = False
         self.overlay.destroy()
         self.capture_frame.destroy()
+        self.toolbar.destroy()
         self.destroy()
 
 
 def main():
-    app = TranslationApp()
+    app = ScreenTranslator()
     app.mainloop()
 
 
