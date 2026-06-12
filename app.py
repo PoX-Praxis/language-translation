@@ -61,6 +61,8 @@ ENGINE_OLLAMA = "Ollama (Local LLM)"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "translator"
 
+DEFAULT_DEEPL_KEY = "d4ba5dbe-ef4e-4735-bca2-3268722e0ecb:fx"
+
 DEEPL_LANG_MAP = {
     "ja": "JA", "en": "EN", "zh-cn": "ZH", "ko": "KO",
     "fr": "FR", "de": "DE", "es": "ES", "pt": "PT-BR",
@@ -601,7 +603,7 @@ class TranslationApp(tk.Tk):
         ttk.Label(self.deepl_frame, text="API Key:").grid(
             row=0, column=0, sticky=tk.W,
         )
-        self.deepl_key_var = tk.StringVar()
+        self.deepl_key_var = tk.StringVar(value=DEFAULT_DEEPL_KEY)
         deepl_entry = ttk.Entry(
             self.deepl_frame, textvariable=self.deepl_key_var,
             width=32, show="*",
