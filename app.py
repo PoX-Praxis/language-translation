@@ -98,6 +98,42 @@ def _first_word(text):
     return words[0] if words else ""
 
 
+_SENTENCE_ENDINGS = set("。.!?！？;；:：」』)）】》…")
+
+
+def _join_hard_wraps(text):
+    """Join hard-wrapped lines while preserving paragraph breaks.
+
+    Lines not ending with sentence-ending punctuation are joined with
+    the next line. Empty lines are treated as paragraph separators.
+    """
+    raw_lines = text.split("\n")
+    paragraphs = []
+    current = []
+
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if current:
+            prev = current[-1]
+            if prev and prev[-1] in _SENTENCE_ENDINGS:
+                paragraphs.append(" ".join(current))
+                current = [stripped]
+            else:
+                current.append(stripped)
+        else:
+            current.append(stripped)
+
+    if current:
+        paragraphs.append(" ".join(current))
+
+    return "\n".join(paragraphs)
+
+
 class CaptureFrame(tk.Toplevel):
     """Movable/resizable capture frame with gray border and transparent center."""
 
@@ -395,11 +431,13 @@ class TranslationApp(tk.Tk):
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
             )
 
-            ocr_text = pytesseract.image_to_string(img).strip()
-            if not ocr_text:
+            raw_text = pytesseract.image_to_string(img).strip()
+            if not raw_text:
                 self._set_status("No text detected in frame")
                 self._prev_first_word = None
                 return
+
+            ocr_text = _join_hard_wraps(raw_text)
 
             current_first = _first_word(ocr_text)
 
