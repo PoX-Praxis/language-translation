@@ -31,14 +31,16 @@ APP_VERSION = "1.0.0"
 # ---------------------------------------------------------------------------
 
 def _find_tesseract():
+    if getattr(sys, "frozen", False):
+        app_dir = os.path.dirname(sys.executable)
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+
     candidates = [
+        os.path.join(app_dir, "tesseract", "tesseract.exe"),
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        os.path.join(os.path.dirname(sys.executable), "tesseract", "tesseract.exe"),
     ]
-    if getattr(sys, "frozen", False):
-        bundle = os.path.dirname(sys.executable)
-        candidates.insert(0, os.path.join(bundle, "tesseract", "tesseract.exe"))
 
     for p in candidates:
         if os.path.exists(p):

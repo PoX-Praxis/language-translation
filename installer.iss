@@ -11,13 +11,14 @@ SolidCompression=yes
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\ScreenTranslator.exe
 WizardStyle=modern
-PrivilegesRequired=lowest
+PrivilegesRequired=admin
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [Files]
+; App files + bundled Tesseract (in dist\ScreenTranslator\tesseract\)
 Source: "dist\ScreenTranslator\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
