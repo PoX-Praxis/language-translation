@@ -138,6 +138,13 @@ def _dominant_color(img):
     return tuple(avg[:3])
 
 
+def _region_bg_color(img, x, y, w, h):
+    region = img.crop((x, y, x + w, y + h))
+    arr = np.array(region)
+    avg = arr.mean(axis=(0, 1)).astype(int)
+    return tuple(avg[:3])
+
+
 def _text_color_for_bg(bg_rgb):
     luminance = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
     return (30, 30, 30) if luminance > 128 else (230, 230, 230)
@@ -393,6 +400,59 @@ class Toolbar(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
 
+def _extract_text_blocks(gray_img):
+    data = pytesseract.image_to_data(
+        gray_img, output_type=pytesseract.Output.DICT,
+    )
+    blocks = {}
+    n = len(data["text"])
+    for i in range(n):
+        conf = int(data["conf"][i])
+        text = data["text"][i].strip()
+        if conf < 0 or not text:
+            continue
+        block_id = data["block_num"][i]
+        if block_id not in blocks:
+            blocks[block_id] = {
+                "x": data["left"][i],
+                "y": data["top"][i],
+                "x2": data["left"][i] + data["width"][i],
+                "y2": data["top"][i] + data["height"][i],
+                "words": [],
+                "lines": {},
+            }
+        b = blocks[block_id]
+        b["x"] = min(b["x"], data["left"][i])
+        b["y"] = min(b["y"], data["top"][i])
+        b["x2"] = max(b["x2"], data["left"][i] + data["width"][i])
+        b["y2"] = max(b["y2"], data["top"][i] + data["height"][i])
+        b["words"].append(text)
+        line_id = data["line_num"][i]
+        if line_id not in b["lines"]:
+            b["lines"][line_id] = []
+        b["lines"][line_id].append(text)
+
+    result = []
+    for bid in sorted(blocks.keys()):
+        b = blocks[bid]
+        line_texts = [
+            " ".join(words)
+            for _, words in sorted(b["lines"].items())
+        ]
+        full_text = _join_hard_wraps("\n".join(line_texts))
+        if not full_text.strip():
+            continue
+        pad = 4
+        result.append({
+            "x": max(0, b["x"] - pad),
+            "y": max(0, b["y"] - pad),
+            "w": b["x2"] - b["x"] + pad * 2,
+            "h": b["y2"] - b["y"] + pad * 2,
+            "text": full_text,
+        })
+    return result
+
+
 def _wrap_text(text, font, max_w, draw):
     lines = []
     for paragraph in text.split("\n"):
@@ -413,28 +473,33 @@ def _wrap_text(text, font, max_w, draw):
     return lines
 
 
-def _render_text_image(w, h, bg_color, fg_color, text, font_size):
-    img = Image.new("RGB", (w, h), bg_color)
+def _render_inplace(base_img, blocks, translations, font_size):
+    img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font = _find_system_font(font_size)
 
-    margin = 8
-    max_w = w - margin * 2
-    max_h = h - margin * 2
+    for block, translated in zip(blocks, translations):
+        x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+        bg_color = _region_bg_color(base_img, x, y, w, h)
+        fg_color = _text_color_for_bg(bg_color)
 
-    wrapped = _wrap_text(text, font, max_w, draw)
+        draw.rectangle([x, y, x + w, y + h], fill=bg_color)
 
-    dy = margin
-    for line in wrapped:
-        if not line:
-            dy += font_size // 2
-            continue
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_h = bbox[3] - bbox[1] + 4
-        if dy + line_h > margin + max_h:
-            break
-        draw.text((margin, dy), line, fill=fg_color, font=font)
-        dy += line_h
+        margin = 2
+        max_w = w - margin * 2
+        wrapped = _wrap_text(translated, font, max_w, draw)
+
+        dy = y + margin
+        for line in wrapped:
+            if not line:
+                dy += font_size // 2
+                continue
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_h = bbox[3] - bbox[1] + 2
+            if dy + line_h > y + h:
+                break
+            draw.text((x + margin, dy), line, fill=fg_color, font=font)
+            dy += line_h
 
     return img
 
@@ -526,21 +591,14 @@ class ScreenTranslator(tk.Tk):
             )
 
             gray = img.convert("L")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                ocr_future = pool.submit(
-                    pytesseract.image_to_string, gray,
-                )
-                bg_future = pool.submit(_dominant_color, img)
+            blocks = _extract_text_blocks(gray)
 
-                raw_text = ocr_future.result().strip()
-                bg_color = bg_future.result()
-
-            if not raw_text:
+            if not blocks:
                 self._prev_first_word = None
                 return
 
-            ocr_text = _join_hard_wraps(raw_text)
-            current_first = _first_word(ocr_text)
+            all_text = " ".join(b["text"] for b in blocks)
+            current_first = _first_word(all_text)
 
             if (self._prev_first_word is not None
                     and current_first == self._prev_first_word):
@@ -550,25 +608,30 @@ class ScreenTranslator(tk.Tk):
                 self.toolbar.lang_var.get(), "en",
             )
 
-            translated, src_lang = self._engine.translate(
-                ocr_text, target_code,
-            )
+            block_texts = [b["text"] for b in blocks]
+            if len(block_texts) == 1:
+                t, _ = self._engine.translate(block_texts[0], target_code)
+                translations = [t]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4,
+                ) as pool:
+                    futures = [
+                        pool.submit(self._engine.translate, bt, target_code)
+                        for bt in block_texts
+                    ]
+                    translations = [f.result()[0] for f in futures]
 
             self._prev_first_word = current_first
-            self._prev_translated = translated
-            self._prev_bg_color = bg_color
 
-            fg_color = _text_color_for_bg(bg_color)
             font_size = int(self.toolbar.fontsize_var.get())
             w, h = region["width"], region["height"]
-            text_img = _render_text_image(
-                w, h, bg_color, fg_color, translated, font_size,
-            )
+            result_img = _render_inplace(img, blocks, translations, font_size)
 
             self.after(
                 0,
                 self.overlay.show_at,
-                region["left"], region["top"], w, h, text_img,
+                region["left"], region["top"], w, h, result_img,
             )
         except Exception as e:
             traceback.print_exc()
