@@ -109,8 +109,9 @@ class OllamaEngine:
         "temperature": 0.1,
         "top_p": 0.9,
         "top_k": 20,
-        "num_predict": 512,
-        "num_ctx": 1024,
+        "num_predict": 256,
+        "num_ctx": 512,
+        "num_batch": 128,
     }
 
     def __init__(self, base_url=DEFAULT_OLLAMA_URL, model=DEFAULT_OLLAMA_MODEL):
@@ -161,15 +162,14 @@ class OllamaEngine:
 
     def translate(self, text, target_code):
         target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
-        prompt = (
-            f"Translate to {target_name}. "
-            f"Output only the translation:\n\n{text}"
-        )
+        prompt = f">{target_name}:\n{text}"
+
+        use_stream = len(text) > 200
 
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "stream": True,
+            "stream": use_stream,
             "options": self.GENERATE_OPTIONS,
         }
 
@@ -182,30 +182,32 @@ class OllamaEngine:
             raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
 
         try:
-            chunks = []
-            for raw_line in resp:
-                raw_line = raw_line.strip()
-                if not raw_line:
-                    continue
-                try:
-                    obj = json.loads(raw_line.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
-                if "error" in obj:
-                    raise RuntimeError(f"Ollama: {obj['error']}")
-                token = obj.get("response", "")
-                if token:
-                    chunks.append(token)
-                    preview = "".join(chunks)
-                    if len(preview) > 40:
-                        preview = "..." + preview[-40:]
-                    self._report(f"Ollama: {preview}")
-                if obj.get("done", False):
-                    break
+            if not use_stream:
+                body = json.loads(resp.read().decode("utf-8"))
+                if "error" in body:
+                    raise RuntimeError(f"Ollama: {body['error']}")
+                raw = body.get("response", "")
+            else:
+                chunks = []
+                for raw_line in resp:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        obj = json.loads(raw_line.decode("utf-8"))
+                    except json.JSONDecodeError:
+                        continue
+                    if "error" in obj:
+                        raise RuntimeError(f"Ollama: {obj['error']}")
+                    token = obj.get("response", "")
+                    if token:
+                        chunks.append(token)
+                    if obj.get("done", False):
+                        break
+                raw = "".join(chunks)
         finally:
             resp.close()
 
-        raw = "".join(chunks)
         if not raw.strip():
             raise RuntimeError("Ollama returned empty response")
 
