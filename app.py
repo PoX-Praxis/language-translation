@@ -3,7 +3,7 @@ Screen Translation Overlay App
 - Captures text within a movable/resizable overlay frame
 - Detects the source language and translates to a selected target language
 - Displays translated text directly inside the capture frame
-- Supports Google Translate and local LLM (Ollama) as translation engines
+- Uses DeepL API for high-quality translation
 - Auto-translates when text changes; click overlay to dismiss
 """
 
@@ -12,18 +12,17 @@ import json
 import os
 import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import ttk
 import traceback
 import urllib.request
 import urllib.error
+import urllib.parse
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import mss
 import pytesseract
-import urllib.parse
 
 if sys.platform == "win32":
     _default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -54,13 +53,6 @@ LANG_NAMES_NATIVE = {v: k for k, v in LANG_OPTIONS.items()}
 BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
 
-ENGINE_GOOGLE = "Google Translate"
-ENGINE_DEEPL = "DeepL"
-ENGINE_OLLAMA = "Ollama (Local LLM)"
-
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "translator"
-
 DEFAULT_DEEPL_KEY = "d4ba5dbe-ef4e-4735-bca2-3268722e0ecb:fx"
 
 DEEPL_LANG_MAP = {
@@ -72,45 +64,8 @@ DEEPL_LANG_MAP = {
 
 
 # ---------------------------------------------------------------------------
-# Translation engines
+# Translation engine
 # ---------------------------------------------------------------------------
-
-class GoogleTranslateEngine:
-    _TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
-
-    def _translate_one(self, text, target_code):
-        params = urllib.parse.urlencode({
-            "client": "gtx",
-            "sl": "auto",
-            "tl": target_code,
-            "dt": "t",
-            "q": text,
-        })
-        url = f"{self._TRANSLATE_URL}?{params}"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        translated = "".join(seg[0] for seg in data[0] if seg[0])
-        src_lang = data[2] if len(data) > 2 else "auto"
-        return translated, src_lang
-
-    def translate(self, text, target_code):
-        paragraphs = [p for p in text.split("\n") if p.strip()]
-        if len(paragraphs) <= 1:
-            return self._translate_one(text, target_code)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [
-                pool.submit(self._translate_one, p, target_code)
-                for p in paragraphs
-            ]
-            results = [f.result() for f in futures]
-        translated = "\n".join(r[0] for r in results)
-        src_lang = results[0][1]
-        return translated, src_lang
-
 
 class DeepLEngine:
     _FREE_URL = "https://api-free.deepl.com/v2/translate"
@@ -137,163 +92,6 @@ class DeepLEngine:
             body = json.loads(resp.read().decode("utf-8"))
         tr = body["translations"][0]
         return tr["text"], tr.get("detected_source_language", "auto").lower()
-
-
-class OllamaEngine:
-    """Uses /api/generate with a custom Modelfile-based model for speed."""
-
-    GENERATE_OPTIONS = {
-        "temperature": 0.1,
-        "top_p": 0.9,
-        "top_k": 20,
-        "num_predict": 256,
-        "num_ctx": 512,
-        "num_batch": 128,
-    }
-
-    def __init__(self, base_url=DEFAULT_OLLAMA_URL, model=DEFAULT_OLLAMA_MODEL):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self._status_cb = None
-
-    def set_status_callback(self, cb):
-        self._status_cb = cb
-
-    def _report(self, msg, color="blue"):
-        if self._status_cb:
-            self._status_cb(msg, color)
-
-    def _post(self, endpoint, payload_dict):
-        data = json.dumps(payload_dict).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}{endpoint}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        return urllib.request.urlopen(req, timeout=300)
-
-    @staticmethod
-    def _clean_output(text):
-        text = text.strip()
-        quote_pairs = [
-            ('"""', '"""'), ("'''", "'''"), ('``', "''"),
-            ("“", "”"), ("「", "」"),
-            ("『", "』"), ('"', '"'), ("'", "'"),
-        ]
-        for open_q, close_q in quote_pairs:
-            if text.startswith(open_q) and text.endswith(close_q):
-                text = text[len(open_q):-len(close_q)].strip()
-                break
-        lines = text.split("\n")
-        cleaned = []
-        for line in lines:
-            low = line.strip().lower()
-            if low.startswith("translation:") or low.startswith("here is"):
-                continue
-            if low.startswith("note:") or low.startswith("---"):
-                break
-            if low.startswith("```"):
-                continue
-            cleaned.append(line)
-        return "\n".join(cleaned).strip()
-
-    def translate(self, text, target_code):
-        target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
-        prompt = f">{target_name}:\n{text}"
-
-        use_stream = len(text) > 200
-
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": use_stream,
-            "options": self.GENERATE_OPTIONS,
-        }
-
-        self._report("Ollama: translating...")
-
-        try:
-            resp = self._post("/api/generate", payload)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
-
-        try:
-            if not use_stream:
-                body = json.loads(resp.read().decode("utf-8"))
-                if "error" in body:
-                    raise RuntimeError(f"Ollama: {body['error']}")
-                raw = body.get("response", "")
-            else:
-                chunks = []
-                for raw_line in resp:
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        obj = json.loads(raw_line.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        continue
-                    if "error" in obj:
-                        raise RuntimeError(f"Ollama: {obj['error']}")
-                    token = obj.get("response", "")
-                    if token:
-                        chunks.append(token)
-                    if obj.get("done", False):
-                        break
-                raw = "".join(chunks)
-        finally:
-            resp.close()
-
-        if not raw.strip():
-            raise RuntimeError("Ollama returned empty response")
-
-        translated = self._clean_output(raw)
-        return translated, "auto"
-
-    def warmup(self):
-        try:
-            self._report(f"Loading {self.model} into memory...")
-            payload = {
-                "model": self.model,
-                "prompt": "Hi",
-                "stream": False,
-                "options": {"num_predict": 1},
-            }
-            resp = self._post("/api/generate", payload)
-            resp.read()
-            resp.close()
-            self._report(f"{self.model} loaded and ready", "green")
-            return True
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            self._report(f"Warmup failed: HTTP {e.code} - {body}", "red")
-            return False
-        except Exception as e:
-            self._report(f"Warmup failed: {e}", "red")
-            return False
-
-    @staticmethod
-    def list_models(base_url=DEFAULT_OLLAMA_URL):
-        try:
-            req = urllib.request.Request(
-                f"{base_url.rstrip('/')}/api/tags",
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-            return [m["name"] for m in body.get("models", [])]
-        except Exception:
-            return []
-
-    @staticmethod
-    def is_available(base_url=DEFAULT_OLLAMA_URL):
-        try:
-            req = urllib.request.Request(f"{base_url.rstrip('/')}/api/tags")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +220,7 @@ class CaptureFrame(tk.Toplevel):
     def _hit_zone(self, x, y):
         w = self.winfo_width()
         h = self.winfo_height()
-        b = BORDER_WIDTH
-        grip = b + 4
+        grip = BORDER_WIDTH + 4
         if x >= w - grip and y >= h - grip:
             return "resize"
         return "drag"
@@ -559,13 +356,11 @@ class TranslationApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Screen Translator")
-        self.geometry("450x320")
+        self.geometry("380x250")
         self.resizable(False, False)
         self.attributes("-topmost", True)
 
-        self._google_engine = GoogleTranslateEngine()
-        self._deepl_engine = DeepLEngine()
-        self._ollama_engine = None
+        self._engine = DeepLEngine(DEFAULT_DEEPL_KEY)
 
         self.running = False
         self._lock = threading.Lock()
@@ -580,87 +375,9 @@ class TranslationApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._check_ollama_status()
-
     def _build_ui(self):
-        # --- Engine settings ---
-        engine_frame = ttk.LabelFrame(self, text="Translation Engine", padding=8)
-        engine_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
-
-        self.engine_var = tk.StringVar(value=ENGINE_GOOGLE)
-        engine_combo = ttk.Combobox(
-            engine_frame, textvariable=self.engine_var,
-            values=[ENGINE_GOOGLE, ENGINE_DEEPL, ENGINE_OLLAMA],
-            state="readonly", width=22,
-        )
-        engine_combo.grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-        engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
-
-        self.deepl_frame = ttk.Frame(engine_frame)
-        self.deepl_frame.grid(
-            row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
-        )
-        ttk.Label(self.deepl_frame, text="API Key:").grid(
-            row=0, column=0, sticky=tk.W,
-        )
-        self.deepl_key_var = tk.StringVar(value=DEFAULT_DEEPL_KEY)
-        deepl_entry = ttk.Entry(
-            self.deepl_frame, textvariable=self.deepl_key_var,
-            width=32, show="*",
-        )
-        deepl_entry.grid(row=0, column=1, padx=5)
-        ttk.Label(
-            self.deepl_frame,
-            text="Free API: https://www.deepl.com/pro-api",
-            foreground="gray",
-        ).grid(row=1, column=0, columnspan=2, sticky=tk.W)
-        self.deepl_frame.grid_remove()
-
-        self.ollama_frame = ttk.Frame(engine_frame)
-        self.ollama_frame.grid(
-            row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
-        )
-
-        ttk.Label(self.ollama_frame, text="URL:").grid(
-            row=0, column=0, sticky=tk.W,
-        )
-        self.ollama_url_var = tk.StringVar(value=DEFAULT_OLLAMA_URL)
-        url_entry = ttk.Entry(
-            self.ollama_frame, textvariable=self.ollama_url_var, width=25,
-        )
-        url_entry.grid(row=0, column=1, padx=5)
-
-        ttk.Label(self.ollama_frame, text="Model:").grid(
-            row=1, column=0, sticky=tk.W,
-        )
-        self.ollama_model_var = tk.StringVar(value=DEFAULT_OLLAMA_MODEL)
-        self.model_combo = ttk.Combobox(
-            self.ollama_frame, textvariable=self.ollama_model_var, width=22,
-        )
-        self.model_combo.grid(row=1, column=1, padx=5, pady=2)
-
-        self.refresh_btn = ttk.Button(
-            self.ollama_frame, text="Refresh", width=8,
-            command=self._refresh_models,
-        )
-        self.refresh_btn.grid(row=1, column=2, padx=2)
-
-        self.ollama_status = ttk.Label(
-            self.ollama_frame, text="", foreground="gray",
-        )
-        self.ollama_status.grid(row=2, column=0, columnspan=3, sticky=tk.W)
-
-        self.warmup_btn = ttk.Button(
-            self.ollama_frame, text="Load Model",
-            command=self._warmup_model,
-        )
-        self.warmup_btn.grid(row=0, column=2, padx=2)
-
-        self.ollama_frame.grid_remove()
-
-        # --- Translation settings ---
         settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
-        settings_frame.pack(fill=tk.X, padx=10, pady=2)
+        settings_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
 
         ttk.Label(settings_frame, text="Target Language:").grid(
             row=0, column=0, sticky=tk.W, pady=2,
@@ -682,7 +399,6 @@ class TranslationApp(tk.Tk):
         )
         fontsize_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
 
-        # --- Controls ---
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -703,82 +419,9 @@ class TranslationApp(tk.Tk):
         self.status_label.pack(side=tk.LEFT, padx=10)
 
         self.info_label = ttk.Label(
-            self, text="", foreground="blue", wraplength=430,
+            self, text="", foreground="blue", wraplength=360,
         )
         self.info_label.pack(fill=tk.X, padx=10, pady=(0, 5))
-
-    # --- Engine management ---
-
-    def _on_engine_change(self, event=None):
-        engine = self.engine_var.get()
-        self.deepl_frame.grid_remove()
-        self.ollama_frame.grid_remove()
-        if engine == ENGINE_DEEPL:
-            self.deepl_frame.grid()
-            self.geometry("450x360")
-        elif engine == ENGINE_OLLAMA:
-            self.ollama_frame.grid()
-            self.geometry("450x420")
-            self._check_ollama_status()
-        else:
-            self.geometry("450x320")
-
-    def _check_ollama_status(self):
-        def _check():
-            url = self.ollama_url_var.get()
-            if OllamaEngine.is_available(url):
-                models = OllamaEngine.list_models(url)
-                self.after(0, lambda: self._update_ollama_ui(True, models))
-            else:
-                self.after(0, lambda: self._update_ollama_ui(False, []))
-        threading.Thread(target=_check, daemon=True).start()
-
-    def _update_ollama_ui(self, available, models):
-        if available:
-            self.ollama_status.config(
-                text=f"Connected ({len(models)} models)",
-                foreground="green",
-            )
-            self.model_combo["values"] = models
-            if models and not self.ollama_model_var.get():
-                self.ollama_model_var.set(models[0])
-        else:
-            self.ollama_status.config(
-                text="Not connected - is Ollama running?",
-                foreground="red",
-            )
-            self.model_combo["values"] = []
-
-    def _refresh_models(self):
-        self.ollama_status.config(text="Checking...", foreground="gray")
-        self._check_ollama_status()
-
-    def _warmup_model(self):
-        self.warmup_btn.config(state=tk.DISABLED)
-        self._set_status("Loading model into memory...")
-
-        def _do():
-            engine = self._get_engine()
-            if isinstance(engine, OllamaEngine):
-                engine.warmup()
-            self.after(0, lambda: self.warmup_btn.config(state=tk.NORMAL))
-        threading.Thread(target=_do, daemon=True).start()
-
-    def _get_engine(self):
-        engine = self.engine_var.get()
-        if engine == ENGINE_DEEPL:
-            self._deepl_engine.api_key = self.deepl_key_var.get().strip()
-            return self._deepl_engine
-        if engine == ENGINE_OLLAMA:
-            url = self.ollama_url_var.get()
-            model = self.ollama_model_var.get()
-            if self._ollama_engine is None or \
-               self._ollama_engine.base_url != url.rstrip("/") or \
-               self._ollama_engine.model != model:
-                self._ollama_engine = OllamaEngine(url, model)
-                self._ollama_engine.set_status_callback(self._set_status)
-            return self._ollama_engine
-        return self._google_engine
 
     # --- Status ---
 
@@ -872,17 +515,15 @@ class TranslationApp(tk.Tk):
 
             target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
 
-            engine = self._get_engine()
-            translated, src_lang = engine.translate(ocr_text, target_code)
+            translated, src_lang = self._engine.translate(ocr_text, target_code)
 
             self._prev_first_word = current_first
             self._prev_translated = translated
             self._prev_bg_color = bg_color
 
-            engine_name = self.engine_var.get().split(" ")[0]
             target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
             self._set_status(
-                f"[{engine_name}] [{src_lang}] → [{target_name}]",
+                f"[DeepL] [{src_lang}] → [{target_name}]",
             )
 
             fg_color = _text_color_for_bg(bg_color)
@@ -899,7 +540,7 @@ class TranslationApp(tk.Tk):
             )
         except urllib.error.URLError as e:
             self._set_status(
-                f"Ollama connection failed: {e.reason}", "red",
+                f"Connection failed: {e.reason}", "red",
             )
             traceback.print_exc()
         except RuntimeError as e:
