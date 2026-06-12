@@ -4,46 +4,29 @@ echo   Screen Translator - Build
 echo ========================================
 echo.
 
-REM --- Step 1: Download Tesseract if not present ---
-if not exist "tesseract\" (
-    echo Downloading Tesseract OCR...
-    mkdir tesseract 2>nul
+REM --- Step 1: Prepare Tesseract ---
+if not exist "tesseract\tesseract.exe" (
+    echo Tesseract not found in tesseract\ folder.
+    echo Checking system installation...
 
-    REM Download Tesseract portable zip from UB-Mannheim
-    REM If curl fails, download manually from:
-    REM   https://github.com/UB-Mannheim/tesseract/wiki
-    REM   and extract to tesseract\ folder
-    curl -L -o tesseract-ocr.zip "https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.5.0.20241111.exe"
-    if %errorlevel% neq 0 (
+    if exist "C:\Program Files\Tesseract-OCR\tesseract.exe" (
+        echo Found Tesseract at C:\Program Files\Tesseract-OCR\
+        echo Copying to tesseract\ folder...
+        xcopy /E /I /Y "C:\Program Files\Tesseract-OCR" "tesseract"
+        echo Tesseract copied successfully.
+    ) else (
         echo.
-        echo [INFO] Auto-download failed.
-        echo Please download Tesseract manually:
+        echo [INFO] Tesseract OCR not found.
+        echo Please install Tesseract first:
         echo   1. Go to https://github.com/UB-Mannheim/tesseract/wiki
-        echo   2. Download the Windows 64-bit installer
-        echo   3. Install to this folder: %CD%\tesseract\
-        echo   4. Re-run this script
+        echo   2. Download and install the Windows 64-bit version
+        echo   3. Re-run this script (it will copy from the install location)
         echo.
-        rmdir tesseract 2>nul
-        pause
-        exit /b 1
-    )
-
-    echo Installing Tesseract to tesseract\ folder...
-    tesseract-ocr.zip /S /D=%CD%\tesseract
-    del tesseract-ocr.zip 2>nul
-
-    if not exist "tesseract\tesseract.exe" (
-        echo.
-        echo [INFO] Tesseract installation needs manual setup.
-        echo   1. Run the downloaded installer
-        echo   2. Set install path to: %CD%\tesseract\
-        echo   3. Select language packs: English + Japanese (recommended)
-        echo   4. Re-run this script
+        echo Or manually copy Tesseract files to: %CD%\tesseract\
         echo.
         pause
         exit /b 1
     )
-    echo Tesseract installed successfully.
 ) else (
     echo Tesseract already present in tesseract\ folder.
 )
