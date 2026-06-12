@@ -34,11 +34,11 @@ if not exist "tesseract\tesseract.exe" (
 echo.
 
 REM --- Step 2: Install PyInstaller ---
-pip install pyinstaller
+python -m pip install pyinstaller
 
 REM --- Step 3: Build exe ---
 echo Building executable...
-pyinstaller --noconfirm --onedir --windowed ^
+python -m PyInstaller --noconfirm --onedir --windowed ^
     --name "ScreenTranslator" ^
     --icon "icon.ico" ^
     --add-data "icon.ico;." ^
