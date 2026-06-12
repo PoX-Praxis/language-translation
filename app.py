@@ -511,37 +511,15 @@ def _wrap_text(text, font, max_w, draw):
     return lines
 
 
-def _classify_blocks(blocks):
-    if not blocks:
-        return {}
-    heights = [b["median_char_h"] for b in blocks]
-    body_h = int(np.median(heights))
-    sizes = {}
-    for i, b in enumerate(blocks):
-        diff = b["median_char_h"] - body_h
-        if diff > body_h * 0.15:
-            sizes[i] = 1
-        elif diff < -body_h * 0.15:
-            sizes[i] = -1
-        else:
-            sizes[i] = 0
-    return sizes
-
-
 def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
-    iw, ih = img.size
-
-    size_classes = _classify_blocks(blocks)
+    font = _find_system_font(font_size)
+    line_spacing = int(font_size * 0.35)
 
     block_renders = []
-    for i, (block, translated) in enumerate(zip(blocks, translations)):
+    for block, translated in zip(blocks, translations):
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-        offset = size_classes.get(i, 0)
-        fs = font_size + offset
-        font = _find_system_font(fs)
-        line_spacing = int(fs * 0.35)
 
         margin = 4
         max_w = w - margin * 2
@@ -550,7 +528,7 @@ def _render_inplace(base_img, blocks, translations, font_size):
         total_h = margin * 2
         for line in wrapped:
             if not line:
-                total_h += fs // 2
+                total_h += font_size // 2
             else:
                 bbox = draw.textbbox((0, 0), line, font=font)
                 total_h += bbox[3] - bbox[1] + line_spacing
@@ -559,8 +537,7 @@ def _render_inplace(base_img, blocks, translations, font_size):
 
         block_renders.append({
             "x": x, "y": y, "w": w, "h": render_h,
-            "wrapped": wrapped, "font": font, "fs": fs,
-            "line_spacing": line_spacing, "margin": margin,
+            "wrapped": wrapped, "margin": margin,
         })
 
     for i in range(len(block_renders) - 1):
@@ -585,11 +562,14 @@ def _render_inplace(base_img, blocks, translations, font_size):
         dy = y + margin
         for line in br["wrapped"]:
             if not line:
-                dy += br["fs"] // 2
+                dy += font_size // 2
                 continue
-            bbox = draw.textbbox((0, 0), line, font=br["font"])
-            line_h = bbox[3] - bbox[1] + br["line_spacing"]
-            draw.text((x + margin, dy), line, fill=fg_color, font=br["font"])
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_h = bbox[3] - bbox[1] + line_spacing
+            draw.text(
+                (x + margin, dy), line, fill=fg_color, font=font,
+                stroke_width=1, stroke_fill=fg_color,
+            )
             dy += line_h
 
     return img
