@@ -222,31 +222,48 @@ class TranslationOverlay(tk.Toplevel):
         return self._visible
 
 
+def _wrap_text(text, font, max_w, draw):
+    lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            lines.append("")
+            continue
+        current_line = ""
+        for char in paragraph:
+            test = current_line + char
+            bbox = draw.textbbox((0, 0), test, font=font)
+            if bbox[2] - bbox[0] > max_w and current_line:
+                lines.append(current_line)
+                current_line = char
+            else:
+                current_line = test
+        if current_line:
+            lines.append(current_line)
+    return lines
+
+
 def _render_text_image(w, h, bg_color, fg_color, text, font_size):
     img = Image.new("RGB", (w, h), bg_color)
     draw = ImageDraw.Draw(img)
     font = _find_system_font(font_size)
 
     margin = 8
-    dx, dy = margin, margin
     max_w = w - margin * 2
+    max_h = h - margin * 2
 
-    for line in text.split("\n"):
-        words = line.split()
-        current_line = ""
-        for word in words:
-            test = f"{current_line} {word}".strip()
-            bbox = draw.textbbox((0, 0), test, font=font)
-            if bbox[2] - bbox[0] > max_w and current_line:
-                draw.text((dx, dy), current_line, fill=fg_color, font=font)
-                dy += bbox[3] - bbox[1] + 4
-                current_line = word
-            else:
-                current_line = test
-        if current_line:
-            bbox = draw.textbbox((0, 0), current_line, font=font)
-            draw.text((dx, dy), current_line, fill=fg_color, font=font)
-            dy += (bbox[3] - bbox[1]) + 4
+    wrapped = _wrap_text(text, font, max_w, draw)
+
+    dy = margin
+    for line in wrapped:
+        if not line:
+            dy += font_size // 2
+            continue
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_h = bbox[3] - bbox[1] + 4
+        if dy + line_h > margin + max_h:
+            break
+        draw.text((margin, dy), line, fill=fg_color, font=font)
+        dy += line_h
 
     return img
 
