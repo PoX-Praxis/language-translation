@@ -57,7 +57,7 @@ ENGINE_GOOGLE = "Google Translate"
 ENGINE_OLLAMA = "Ollama (Local LLM)"
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "gemma3:4b"
+DEFAULT_OLLAMA_MODEL = "gemma3:1b"
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,15 @@ class OllamaEngine:
     @staticmethod
     def _clean_output(text):
         text = text.strip()
-        for q in ['"""', "'''", '``', '"', "'", "“", "”",
-                   "「", "」", "『", "』"]:
-            if text.startswith(q) and text.endswith(q):
-                text = text[len(q):-len(q)].strip()
+        quote_pairs = [
+            ('"""', '"""'), ("'''", "'''"), ('``', "''"),
+            ("“", "”"), ("「", "」"),
+            ("『", "』"), ('"', '"'), ("'", "'"),
+        ]
+        for open_q, close_q in quote_pairs:
+            if text.startswith(open_q) and text.endswith(close_q):
+                text = text[len(open_q):-len(close_q)].strip()
+                break
         lines = text.split("\n")
         cleaned = []
         for line in lines:
@@ -102,8 +107,19 @@ class OllamaEngine:
                 continue
             if low.startswith("note:") or low.startswith("---"):
                 break
+            if low.startswith("```"):
+                continue
             cleaned.append(line)
         return "\n".join(cleaned).strip()
+
+    def _ollama_request(self, payload_dict, stream=True):
+        data = json.dumps(payload_dict).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/api/chat",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(req, timeout=300)
 
     def translate(self, text, target_code):
         target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
@@ -112,9 +128,11 @@ class OllamaEngine:
             {
                 "role": "system",
                 "content": (
-                    f"You are a translator. Translate text into {target_name}. "
-                    f"Rules: output ONLY the translation. No explanations, "
-                    f"no notes, no quotes, no markdown, no labels."
+                    f"You are a professional translator. "
+                    f"Translate the user's text into {target_name}. "
+                    f"Output the translated text only. "
+                    f"Do not include any explanations, notes, "
+                    f"quotation marks, or markdown formatting."
                 ),
             },
             {
@@ -123,7 +141,7 @@ class OllamaEngine:
             },
         ]
 
-        payload = json.dumps({
+        payload = {
             "model": self.model,
             "messages": messages,
             "stream": True,
@@ -131,24 +149,28 @@ class OllamaEngine:
                 "temperature": 0.1,
                 "num_predict": 1024,
             },
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            f"{self.base_url}/api/chat",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
+        }
 
         self._report("Ollama: translating...")
 
-        resp = urllib.request.urlopen(req, timeout=300)
+        try:
+            resp = self._ollama_request(payload)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Ollama HTTP {e.code}: {body}") from e
+
         try:
             chunks = []
-            for line in resp:
-                line = line.strip()
-                if not line:
+            for raw_line in resp:
+                raw_line = raw_line.strip()
+                if not raw_line:
                     continue
-                obj = json.loads(line.decode("utf-8"))
+                try:
+                    obj = json.loads(raw_line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if "error" in obj:
+                    raise RuntimeError(f"Ollama error: {obj['error']}")
                 msg = obj.get("message", {})
                 token = msg.get("content", "")
                 if token:
@@ -163,27 +185,30 @@ class OllamaEngine:
             resp.close()
 
         raw = "".join(chunks)
+        if not raw.strip():
+            raise RuntimeError("Ollama returned empty response")
+
         translated = self._clean_output(raw)
         return translated, "auto"
 
     def warmup(self):
         try:
-            self._report("Loading model into memory...")
-            payload = json.dumps({
+            self._report(f"Loading {self.model} into memory...")
+            payload = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
                 "options": {"num_predict": 1},
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"{self.base_url}/api/chat",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                resp.read()
-            self._report("Model loaded and ready", "green")
+            }
+            resp = self._ollama_request(payload, stream=False)
+            resp.read()
+            resp.close()
+            self._report(f"{self.model} loaded and ready", "green")
             return True
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            self._report(f"Warmup failed: HTTP {e.code} - {body}", "red")
+            return False
         except Exception as e:
             self._report(f"Warmup failed: {e}", "red")
             return False
@@ -774,12 +799,16 @@ class TranslationApp(tk.Tk):
                 self.overlay.show_at,
                 region["left"], region["top"], w, h, text_img,
             )
-        except urllib.error.URLError:
+        except urllib.error.URLError as e:
             self._set_status(
-                "Ollama connection failed - is it running?", "red",
+                f"Ollama connection failed: {e.reason}", "red",
             )
-        except Exception as e:
+            traceback.print_exc()
+        except RuntimeError as e:
             self._set_status(f"Error: {e}", "red")
+            traceback.print_exc()
+        except Exception as e:
+            self._set_status(f"Error: {type(e).__name__}: {e}", "red")
             traceback.print_exc()
         finally:
             self._lock.release()
