@@ -6,3 +6,5 @@ venv/
 dist/
 build/
 *.egg-info/
+installer_output/
+*.spec.bak

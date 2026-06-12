@@ -1,5 +1,5 @@
 """
-Screen Translation Overlay App
+Screen Translator
 - Captures text within a movable/resizable overlay frame
 - Control toolbar attached to top-right of the frame
 - Uses DeepL API for high-quality translation
@@ -12,7 +12,7 @@ import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox, simpledialog
 import traceback
 import urllib.request
 import urllib.error
@@ -23,10 +23,70 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 import mss
 import pytesseract
 
-if sys.platform == "win32":
-    _default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    if os.path.exists(_default_path):
-        pytesseract.pytesseract.tesseract_cmd = _default_path
+APP_NAME = "Screen Translator"
+APP_VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Config / Tesseract detection
+# ---------------------------------------------------------------------------
+
+def _config_dir():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~")
+    d = os.path.join(base, "ScreenTranslator")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _config_path():
+    return os.path.join(_config_dir(), "config.json")
+
+
+def _load_config():
+    path = _config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_config(cfg):
+    path = _config_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _find_tesseract():
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.join(os.path.dirname(sys.executable), "tesseract", "tesseract.exe"),
+    ]
+    if getattr(sys, "frozen", False):
+        bundle = os.path.dirname(sys.executable)
+        candidates.insert(0, os.path.join(bundle, "tesseract", "tesseract.exe"))
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _setup_tesseract():
+    tess = _find_tesseract()
+    if tess:
+        pytesseract.pytesseract.tesseract_cmd = tess
+        return True
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
 
 LANG_OPTIONS = {
     "日本語": "ja",
@@ -54,6 +114,50 @@ MIN_FRAME_SIZE = BORDER_WIDTH * 4
 TOOLBAR_HEIGHT = 28
 
 DEFAULT_DEEPL_KEY = "d4ba5dbe-ef4e-4735-bca2-3268722e0ecb:fx"
+
+
+class SetupDialog(tk.Toplevel):
+    def __init__(self, master, current_key=""):
+        super().__init__(master)
+        self.title(f"{APP_NAME} - Setup")
+        self.geometry("420x180")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self.result = None
+
+        ttk.Label(self, text="DeepL API Key", font=("", 11, "bold")).pack(
+            pady=(15, 5),
+        )
+        ttk.Label(
+            self,
+            text="https://www.deepl.com/pro-api (Free plan available)",
+            foreground="gray",
+        ).pack()
+
+        self.key_var = tk.StringVar(value=current_key)
+        entry = ttk.Entry(self, textvariable=self.key_var, width=48)
+        entry.pack(pady=10)
+        entry.focus_set()
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="OK", command=self._ok).pack(
+            side=tk.LEFT, padx=5,
+        )
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(
+            side=tk.LEFT, padx=5,
+        )
+
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.grab_set()
+
+    def _ok(self):
+        key = self.key_var.get().strip()
+        if not key:
+            messagebox.showwarning("Error", "API key is required.", parent=self)
+            return
+        self.result = key
+        self.destroy()
 
 DEEPL_LANG_MAP = {
     "ja": "JA", "en": "EN", "zh-cn": "ZH", "ko": "KO",
@@ -584,7 +688,9 @@ class ScreenTranslator(tk.Tk):
         super().__init__()
         self.withdraw()
 
-        self._engine = DeepLEngine(DEFAULT_DEEPL_KEY)
+        self._cfg = _load_config()
+        api_key = self._cfg.get("deepl_api_key", DEFAULT_DEEPL_KEY)
+        self._engine = DeepLEngine(api_key)
 
         self.running = False
         self._lock = threading.Lock()
@@ -736,6 +842,32 @@ class ScreenTranslator(tk.Tk):
 
 
 def main():
+    if not _setup_tesseract():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            APP_NAME,
+            "Tesseract OCR is not installed.\n\n"
+            "Please install from:\n"
+            "https://github.com/UB-Mannheim/tesseract/wiki",
+        )
+        root.destroy()
+        return
+
+    cfg = _load_config()
+    if not cfg.get("deepl_api_key"):
+        root = tk.Tk()
+        root.withdraw()
+        dlg = SetupDialog(root, DEFAULT_DEEPL_KEY)
+        root.wait_window(dlg)
+        if dlg.result:
+            cfg["deepl_api_key"] = dlg.result
+            _save_config(cfg)
+        else:
+            root.destroy()
+            return
+        root.destroy()
+
     app = ScreenTranslator()
     app.mainloop()
 
