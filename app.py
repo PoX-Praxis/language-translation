@@ -376,12 +376,15 @@ class Toolbar(tk.Toplevel):
         lang_combo.pack(side=tk.LEFT, padx=1)
 
         self.fontsize_var = tk.StringVar(value="16")
+        self.fontsize_var.trace_add("write", self._on_fontsize_change)
         fontsize_spin = tk.Spinbox(
             f, from_=8, to=48, textvariable=self.fontsize_var,
             width=3, font=("", 8), bg="#555555", fg="white",
             buttonbackground="#666666",
         )
         fontsize_spin.pack(side=tk.LEFT, padx=1)
+
+        self._on_fontsize = None
 
         self.toggle_btn = tk.Button(
             f, text="Start", command=self._do_toggle,
@@ -406,6 +409,14 @@ class Toolbar(tk.Toplevel):
             relief=tk.FLAT, padx=4, pady=0,
         )
         self.close_btn.pack(side=tk.LEFT, padx=1)
+
+    def _on_fontsize_change(self, *args):
+        if self._on_fontsize:
+            try:
+                int(self.fontsize_var.get())
+                self._on_fontsize()
+            except ValueError:
+                pass
 
     def _do_toggle(self):
         if self._on_toggle:
@@ -578,8 +589,7 @@ class ScreenTranslator(tk.Tk):
         self.running = False
         self._lock = threading.Lock()
         self._prev_first_word = None
-        self._prev_translated = ""
-        self._prev_bg_color = (255, 255, 255)
+        self._last_render = None
 
         self.capture_frame = CaptureFrame(self)
         self.overlay = TranslationOverlay(self, on_click=self._on_overlay_click)
@@ -588,6 +598,7 @@ class ScreenTranslator(tk.Tk):
             on_toggle=self._toggle,
             on_translate=self._manual_translate,
         )
+        self.toolbar._on_fontsize = self._on_fontsize_change
 
         self.capture_frame.set_on_move(self._reposition_toolbar)
 
@@ -636,6 +647,17 @@ class ScreenTranslator(tk.Tk):
 
     def _on_overlay_click(self):
         self._prev_first_word = None
+
+    def _on_fontsize_change(self):
+        if self._last_render and self.overlay.is_visible:
+            lr = self._last_render
+            font_size = int(self.toolbar.fontsize_var.get())
+            result_img = _render_inplace(
+                lr["img"], lr["blocks"], lr["translations"], font_size,
+            )
+            self.overlay.show_at(
+                lr["x"], lr["y"], lr["w"], lr["h"], result_img,
+            )
 
     # --- Core translation ---
 
@@ -686,12 +708,19 @@ class ScreenTranslator(tk.Tk):
 
             font_size = int(self.toolbar.fontsize_var.get())
             w, h = region["width"], region["height"]
+            rx, ry = region["left"], region["top"]
             result_img = _render_inplace(img, blocks, translations, font_size)
+
+            self._last_render = {
+                "img": img, "blocks": blocks,
+                "translations": translations,
+                "x": rx, "y": ry, "w": w, "h": h,
+            }
 
             self.after(
                 0,
                 self.overlay.show_at,
-                region["left"], region["top"], w, h, result_img,
+                rx, ry, w, h, result_img,
             )
         except Exception as e:
             traceback.print_exc()
