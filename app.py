@@ -138,11 +138,44 @@ def _dominant_color(img):
     return tuple(avg[:3])
 
 
-def _region_bg_color(img, x, y, w, h):
-    region = img.crop((x, y, x + w, y + h))
+def _region_colors(img, x, y, w, h):
+    iw, ih = img.size
+    x = max(0, x)
+    y = max(0, y)
+    x2 = min(iw, x + w)
+    y2 = min(ih, y + h)
+    if x2 <= x or y2 <= y:
+        return (0, 0, 0), (255, 255, 255)
+
+    edge_pixels = []
+    region = img.crop((x, y, x2, y2))
     arr = np.array(region)
-    avg = arr.mean(axis=(0, 1)).astype(int)
-    return tuple(avg[:3])
+    rh, rw = arr.shape[:2]
+
+    if rh >= 2 and rw >= 2:
+        edge_pixels.append(arr[0, :])
+        edge_pixels.append(arr[-1, :])
+        edge_pixels.append(arr[:, 0])
+        edge_pixels.append(arr[:, -1])
+        edges = np.concatenate(edge_pixels, axis=0)
+        bg = tuple(np.median(edges, axis=0).astype(int)[:3])
+    else:
+        bg = tuple(arr.mean(axis=(0, 1)).astype(int)[:3])
+
+    center = arr[rh // 4 : rh * 3 // 4, rw // 4 : rw * 3 // 4]
+    if center.size > 0:
+        flat = center.reshape(-1, 3)
+        bg_arr = np.array(bg)
+        dists = np.linalg.norm(flat.astype(float) - bg_arr.astype(float), axis=1)
+        far_mask = dists > 30
+        if far_mask.sum() > 10:
+            fg = tuple(np.median(flat[far_mask], axis=0).astype(int)[:3])
+        else:
+            fg = _text_color_for_bg(bg)
+    else:
+        fg = _text_color_for_bg(bg)
+
+    return bg, fg
 
 
 def _text_color_for_bg(bg_rgb):
@@ -442,12 +475,13 @@ def _extract_text_blocks(gray_img):
         full_text = _join_hard_wraps("\n".join(line_texts))
         if not full_text.strip():
             continue
-        pad = 4
+        pad_x = 6
+        pad_y = 4
         result.append({
-            "x": max(0, b["x"] - pad),
-            "y": max(0, b["y"] - pad),
-            "w": b["x2"] - b["x"] + pad * 2,
-            "h": b["y2"] - b["y"] + pad * 2,
+            "x": max(0, b["x"] - pad_x),
+            "y": max(0, b["y"] - pad_y),
+            "w": b["x2"] - b["x"] + pad_x * 2,
+            "h": b["y2"] - b["y"] + pad_y * 2,
             "text": full_text,
         })
     return result
@@ -477,15 +511,15 @@ def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     font = _find_system_font(font_size)
+    line_spacing = int(font_size * 0.35)
 
     for block, translated in zip(blocks, translations):
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-        bg_color = _region_bg_color(base_img, x, y, w, h)
-        fg_color = _text_color_for_bg(bg_color)
+        bg_color, fg_color = _region_colors(base_img, x, y, w, h)
 
         draw.rectangle([x, y, x + w, y + h], fill=bg_color)
 
-        margin = 2
+        margin = 4
         max_w = w - margin * 2
         wrapped = _wrap_text(translated, font, max_w, draw)
 
@@ -495,7 +529,7 @@ def _render_inplace(base_img, blocks, translations, font_size):
                 dy += font_size // 2
                 continue
             bbox = draw.textbbox((0, 0), line, font=font)
-            line_h = bbox[3] - bbox[1] + 2
+            line_h = bbox[3] - bbox[1] + line_spacing
             if dy + line_h > y + h:
                 break
             draw.text((x + margin, dy), line, fill=fg_color, font=font)
