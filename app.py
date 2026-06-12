@@ -3,7 +3,7 @@ Screen Translation Overlay App
 - Captures text within a movable/resizable overlay frame
 - Detects the source language and translates to a selected target language
 - Displays translated text directly inside the capture frame
-- Triggers translation when the first detected word changes
+- Click inside the frame to translate; click again to dismiss and re-scan
 """
 
 import os
@@ -26,7 +26,6 @@ if sys.platform == "win32":
     if os.path.exists(_default_path):
         pytesseract.pytesseract.tesseract_cmd = _default_path
 
-
 LANG_OPTIONS = {
     "日本語": "ja",
     "English": "en",
@@ -48,8 +47,6 @@ LANG_OPTIONS = {
 
 BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
-POLL_INTERVAL_MS = 800
-
 TRANSPARENT_COLOR = "#010101"
 
 
@@ -98,15 +95,10 @@ def _text_color_for_bg(bg_rgb):
     return (30, 30, 30) if luminance > 128 else (230, 230, 230)
 
 
-def _first_word(text):
-    words = text.split()
-    return words[0] if words else ""
-
-
 class CaptureFrame(tk.Toplevel):
     """Transparent movable/resizable capture frame with gray border."""
 
-    def __init__(self, master, on_move=None):
+    def __init__(self, master, on_click_inside=None):
         super().__init__(master)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
@@ -114,7 +106,7 @@ class CaptureFrame(tk.Toplevel):
         self.configure(bg=TRANSPARENT_COLOR)
         self.geometry("500x300+200+200")
 
-        self._on_move_cb = on_move
+        self._on_click_inside = on_click_inside
         self._drag_data = {"x": 0, "y": 0}
         self._resize_data = {"x": 0, "y": 0, "w": 0, "h": 0}
         self._zone = "none"
@@ -151,7 +143,7 @@ class CaptureFrame(tk.Toplevel):
             return "resize"
         if x < b or y < b or x >= w - b or y >= h - b:
             return "drag"
-        return "none"
+        return "inside"
 
     def _on_press(self, event):
         zone = self._hit_zone(event.x, event.y)
@@ -164,22 +156,20 @@ class CaptureFrame(tk.Toplevel):
             self._resize_data["y"] = event.y_root
             self._resize_data["w"] = self.winfo_width()
             self._resize_data["h"] = self.winfo_height()
+        elif zone == "inside" and self._on_click_inside:
+            self._on_click_inside()
 
     def _on_motion(self, event):
         if self._zone == "drag":
             x = event.x_root - self._drag_data["x"]
             y = event.y_root - self._drag_data["y"]
             self.geometry(f"+{x}+{y}")
-            if self._on_move_cb:
-                self._on_move_cb()
         elif self._zone == "resize":
             dx = event.x_root - self._resize_data["x"]
             dy = event.y_root - self._resize_data["y"]
             new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
             new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
             self.geometry(f"{new_w}x{new_h}")
-            if self._on_move_cb:
-                self._on_move_cb()
 
     def get_inner_region(self):
         self.update_idletasks()
@@ -193,20 +183,27 @@ class CaptureFrame(tk.Toplevel):
 
 
 class TranslationOverlay(tk.Toplevel):
-    """Overlay window that shows translated text inside the capture area."""
+    """Separate top-level overlay that shows translated text."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_click=None):
         super().__init__(master)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg="#FFFFFF")
 
-        self.canvas = tk.Canvas(self, highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-
+        self._on_click = on_click
         self._photo = None
         self._visible = False
+
+        self.label = tk.Label(self, borderwidth=0)
+        self.label.pack(fill=tk.BOTH, expand=True)
+        self.label.bind("<ButtonPress-1>", self._handle_click)
+
         self.withdraw()
+
+    def _handle_click(self, event):
+        if self._on_click:
+            self._on_click()
 
     def show_translation(self, region, bg_color, text, font_size=16):
         if not text:
@@ -216,15 +213,13 @@ class TranslationOverlay(tk.Toplevel):
         w, h = region["width"], region["height"]
         x, y = region["left"], region["top"]
 
-        self.geometry(f"{w}x{h}+{x}+{y}")
-
         fg_color = _text_color_for_bg(bg_color)
 
         img = Image.new("RGB", (w, h), bg_color)
         draw = ImageDraw.Draw(img)
         font = _find_system_font(font_size)
 
-        margin = 6
+        margin = 8
         draw_x, draw_y = margin, margin
         max_w = w - margin * 2
 
@@ -234,12 +229,14 @@ class TranslationOverlay(tk.Toplevel):
             for word in words:
                 test = f"{current_line} {word}".strip()
                 bbox = draw.textbbox((0, 0), test, font=font)
-                if bbox[2] - bbox[0] > max_w and current_line:
+                line_w = bbox[2] - bbox[0]
+                if line_w > max_w and current_line:
                     draw.text(
                         (draw_x, draw_y), current_line,
                         fill=fg_color, font=font,
                     )
-                    draw_y += bbox[3] - bbox[1] + 4
+                    line_h = bbox[3] - bbox[1]
+                    draw_y += line_h + 4
                     current_line = word
                 else:
                     current_line = test
@@ -249,20 +246,19 @@ class TranslationOverlay(tk.Toplevel):
                     (draw_x, draw_y), current_line,
                     fill=fg_color, font=font,
                 )
-                draw_y += bbox[3] - bbox[1] + 4
+                draw_y += (bbox[3] - bbox[1]) + 4
 
         self._photo = ImageTk.PhotoImage(img)
-        self.canvas.config(width=w, height=h)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+        self.label.config(image=self._photo)
+        self.geometry(f"{w}x{h}+{x}+{y}")
         self.deiconify()
         self.lift()
+        self.attributes("-topmost", True)
         self._visible = True
 
     def hide(self):
-        if self._visible:
-            self.withdraw()
-            self._visible = False
+        self.withdraw()
+        self._visible = False
 
     @property
     def is_visible(self):
@@ -281,13 +277,20 @@ class TranslationApp(tk.Tk):
 
         self.translator = Translator()
         self.running = False
-        self._prev_first_word = ""
-        self._overlay_showing = False
         self._lock = threading.Lock()
+        self._prev_first_word = ""
+        self._prev_translated = ""
+        self._prev_bg_color = (255, 255, 255)
 
         self._build_ui()
-        self.capture_frame = CaptureFrame(self, on_move=self._on_frame_move)
-        self.overlay = TranslationOverlay(self)
+
+        self.capture_frame = CaptureFrame(
+            self, on_click_inside=self._on_frame_click,
+        )
+        self.overlay = TranslationOverlay(
+            self, on_click=self._on_overlay_click,
+        )
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
@@ -333,7 +336,11 @@ class TranslationApp(tk.Tk):
         self.info_label.pack(fill=tk.X, padx=10, pady=(0, 5))
 
     def _set_status(self, text, color="blue"):
-        self.after(0, lambda: self.info_label.config(text=text, foreground=color))
+        self.after(
+            0, lambda t=text, c=color: self.info_label.config(
+                text=t, foreground=c,
+            ),
+        )
 
     def _toggle(self):
         if self.running:
@@ -341,32 +348,45 @@ class TranslationApp(tk.Tk):
             self.toggle_btn.config(text="▶  Start")
             self.status_label.config(text="Stopped", foreground="gray")
             self.overlay.hide()
-            self._prev_first_word = ""
             self._set_status("")
         else:
             self.running = True
-            self._prev_first_word = ""
             self.toggle_btn.config(text="⏹  Stop")
             self.status_label.config(text="Running", foreground="green")
-            self._set_status("Scanning...")
-            self._schedule_poll()
+            self._set_status("Click inside the frame to translate")
+            self._start_polling()
 
-    def _schedule_poll(self):
+    def _start_polling(self):
         if not self.running:
             return
-        threading.Thread(target=self._poll_and_translate, daemon=True).start()
-        self.after(POLL_INTERVAL_MS, self._schedule_poll)
+        if not self.overlay.is_visible:
+            threading.Thread(
+                target=self._check_and_translate, daemon=True,
+            ).start()
+        self.after(800, self._start_polling)
 
-    def _poll_and_translate(self):
+    def _on_frame_click(self):
+        if not self.running:
+            return
+        self.overlay.hide()
+        self._prev_first_word = ""
+        self._set_status("Translating...")
+        threading.Thread(
+            target=self._capture_and_translate, daemon=True,
+        ).start()
+
+    def _on_overlay_click(self):
+        if not self.running:
+            return
+        self.overlay.hide()
+        self._prev_first_word = ""
+        self._set_status("Re-scanning... click frame to translate again")
+
+    def _check_and_translate(self):
         if not self._lock.acquire(blocking=False):
             return
         try:
-            if self.overlay.is_visible:
-                self.after(0, self.overlay.hide)
-                time.sleep(0.15)
-
             region = self.capture_frame.get_inner_region()
-
             with mss.mss() as sct:
                 screenshot = sct.grab(region)
             img = Image.frombytes(
@@ -375,56 +395,72 @@ class TranslationApp(tk.Tk):
 
             ocr_text = pytesseract.image_to_string(img).strip()
             if not ocr_text:
-                self._set_status("No text detected in frame")
                 self._prev_first_word = ""
                 return
 
             current_first = _first_word(ocr_text)
-            self._set_status(f"Detected: {ocr_text[:60]}...")
-
-            if current_first == self._prev_first_word:
-                if self._prev_translated:
-                    font_size = int(self.fontsize_var.get())
-                    self.after(
-                        0,
-                        self.overlay.show_translation,
-                        region, self._prev_bg_color,
-                        self._prev_translated, font_size,
-                    )
-                return
-
-            self._prev_first_word = current_first
-            self._set_status("Translating...")
-
-            bg_color = _dominant_color(img)
-            target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
-            result = self.translator.translate(ocr_text, dest=target_code)
-            translated = result.text
-
-            self._prev_translated = translated
-            self._prev_bg_color = bg_color
-
-            src_lang = LANGUAGES.get(result.src.lower(), result.src)
-            self._set_status(
-                f"[{src_lang}] → [{LANGUAGES.get(target_code, target_code)}] OK",
-            )
-
-            font_size = int(self.fontsize_var.get())
-            self.after(
-                0,
-                self.overlay.show_translation,
-                region, bg_color, translated, font_size,
-            )
+            if current_first != self._prev_first_word and self._prev_first_word != "":
+                self._prev_first_word = current_first
+                self._set_status("Text changed - translating...")
+                self._do_translate(img, ocr_text, region)
+            elif self._prev_first_word == "":
+                self._set_status(
+                    f"Ready: \"{ocr_text[:50]}...\" - click frame to translate",
+                )
         except Exception as e:
             self._set_status(f"Error: {e}", "red")
             traceback.print_exc()
         finally:
             self._lock.release()
 
-    def _on_frame_move(self):
-        if self.running:
-            self.overlay.hide()
-            self._prev_first_word = ""
+    def _capture_and_translate(self):
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            time.sleep(0.1)
+
+            region = self.capture_frame.get_inner_region()
+            with mss.mss() as sct:
+                screenshot = sct.grab(region)
+            img = Image.frombytes(
+                "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
+            )
+
+            ocr_text = pytesseract.image_to_string(img).strip()
+            if not ocr_text:
+                self._set_status("No text detected in frame", "orange")
+                return
+
+            self._prev_first_word = _first_word(ocr_text)
+            self._do_translate(img, ocr_text, region)
+        except Exception as e:
+            self._set_status(f"Error: {e}", "red")
+            traceback.print_exc()
+        finally:
+            self._lock.release()
+
+    def _do_translate(self, img, ocr_text, region):
+        bg_color = _dominant_color(img)
+        target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
+
+        result = self.translator.translate(ocr_text, dest=target_code)
+        translated = result.text
+
+        self._prev_translated = translated
+        self._prev_bg_color = bg_color
+
+        src_lang = LANGUAGES.get(result.src.lower(), result.src)
+        self._set_status(
+            f"[{src_lang}] → "
+            f"[{LANGUAGES.get(target_code, target_code)}] done",
+        )
+
+        font_size = int(self.fontsize_var.get())
+        self.after(
+            0,
+            self.overlay.show_translation,
+            region, bg_color, translated, font_size,
+        )
 
     def _on_close(self):
         self.running = False
@@ -435,8 +471,6 @@ class TranslationApp(tk.Tk):
 
 def main():
     app = TranslationApp()
-    app._prev_translated = ""
-    app._prev_bg_color = (255, 255, 255)
     app.mainloop()
 
 
