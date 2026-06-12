@@ -1,0 +1,21 @@
+FROM gemma3:1b
+
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER top_k 20
+PARAMETER num_predict 512
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 1024
+PARAMETER num_thread 4
+
+SYSTEM """You are a professional translator. You translate text between languages with high accuracy and natural fluency. Rules:
+1. Output ONLY the translation. No explanations, notes, or original text.
+2. Preserve formatting, line breaks, and punctuation style of the target language.
+3. Use natural, idiomatic expressions in the target language."""
+
+TEMPLATE """{{ if .System }}<start_of_turn>user
+{{ .System }}{{ end }}
+<start_of_turn>user
+{{ .Prompt }}<end_of_turn>
+<start_of_turn>model
+{{ .Response }}<end_of_turn>"""
