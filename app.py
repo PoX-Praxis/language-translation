@@ -57,7 +57,7 @@ ENGINE_GOOGLE = "Google Translate"
 ENGINE_OLLAMA = "Ollama (Local LLM)"
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "qwen2.5"
+DEFAULT_OLLAMA_MODEL = "gemma3:4b"
 
 
 # ---------------------------------------------------------------------------
@@ -87,33 +87,60 @@ class OllamaEngine:
         if self._status_cb:
             self._status_cb(msg, color)
 
+    @staticmethod
+    def _clean_output(text):
+        text = text.strip()
+        for q in ['"""', "'''", '``', '"', "'", "“", "”",
+                   "「", "」", "『", "』"]:
+            if text.startswith(q) and text.endswith(q):
+                text = text[len(q):-len(q)].strip()
+        lines = text.split("\n")
+        cleaned = []
+        for line in lines:
+            low = line.strip().lower()
+            if low.startswith("translation:") or low.startswith("here is"):
+                continue
+            if low.startswith("note:") or low.startswith("---"):
+                break
+            cleaned.append(line)
+        return "\n".join(cleaned).strip()
+
     def translate(self, text, target_code):
         target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
-        prompt = (
-            f"Translate the following text into {target_name}. "
-            f"Output ONLY the translated text, nothing else. "
-            f"Do not add explanations, notes, or quotation marks.\n\n"
-            f"{text}"
-        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"You are a translator. Translate text into {target_name}. "
+                    f"Rules: output ONLY the translation. No explanations, "
+                    f"no notes, no quotes, no markdown, no labels."
+                ),
+            },
+            {
+                "role": "user",
+                "content": text,
+            },
+        ]
 
         payload = json.dumps({
             "model": self.model,
-            "prompt": prompt,
+            "messages": messages,
             "stream": True,
             "options": {
                 "temperature": 0.1,
+                "num_predict": 1024,
             },
         }).encode("utf-8")
 
         req = urllib.request.Request(
-            f"{self.base_url}/api/generate",
+            f"{self.base_url}/api/chat",
             data=payload,
             headers={"Content-Type": "application/json"},
         )
 
-        self._report("Ollama: generating...")
+        self._report("Ollama: translating...")
 
-        # Stream response to avoid timeout
         resp = urllib.request.urlopen(req, timeout=300)
         try:
             chunks = []
@@ -122,33 +149,34 @@ class OllamaEngine:
                 if not line:
                     continue
                 obj = json.loads(line.decode("utf-8"))
-                token = obj.get("response", "")
+                msg = obj.get("message", {})
+                token = msg.get("content", "")
                 if token:
                     chunks.append(token)
                     preview = "".join(chunks)
-                    if len(preview) > 30:
-                        preview = "..." + preview[-30:]
+                    if len(preview) > 40:
+                        preview = "..." + preview[-40:]
                     self._report(f"Ollama: {preview}")
                 if obj.get("done", False):
                     break
         finally:
             resp.close()
 
-        translated = "".join(chunks).strip()
+        raw = "".join(chunks)
+        translated = self._clean_output(raw)
         return translated, "auto"
 
     def warmup(self):
-        """Send a short request to pre-load the model into memory."""
         try:
             self._report("Loading model into memory...")
             payload = json.dumps({
                 "model": self.model,
-                "prompt": "Hi",
+                "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
                 "options": {"num_predict": 1},
             }).encode("utf-8")
             req = urllib.request.Request(
-                f"{self.base_url}/api/generate",
+                f"{self.base_url}/api/chat",
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
