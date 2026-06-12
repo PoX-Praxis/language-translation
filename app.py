@@ -2,21 +2,21 @@
 Screen Translation Overlay App
 - Captures text within a movable/resizable overlay frame
 - Detects the source language and translates to a selected target language
-- Start/stop translation with a button click
+- Displays translated text directly inside the capture frame
+- Triggers translation when the first detected word changes
 """
-
-import threading
-import tkinter as tk
-from tkinter import ttk
-from io import BytesIO
-
-from PIL import Image
-import mss
-import pytesseract
-from googletrans import Translator, LANGUAGES
 
 import os
 import sys
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+import mss
+import pytesseract
+from googletrans import Translator, LANGUAGES
 
 if sys.platform == "win32":
     _default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -43,89 +43,231 @@ LANG_OPTIONS = {
     "ไทย": "th",
 }
 
-TESSERACT_LANG_MAP = {
-    "ja": "jpn",
-    "en": "eng",
-    "zh-cn": "chi_sim",
-    "ko": "kor",
-    "fr": "fra",
-    "de": "deu",
-    "es": "spa",
-    "pt": "por",
-    "ru": "rus",
-    "ar": "ara",
-    "hi": "hin",
-    "it": "ita",
-    "nl": "nld",
-    "tr": "tur",
-    "vi": "vie",
-    "th": "tha",
-}
+BORDER_WIDTH = 14  # ~5mm at 96 DPI
+MIN_FRAME_SIZE = BORDER_WIDTH * 4
+POLL_INTERVAL_MS = 500
 
-INTERVAL_MS = 2000
-MIN_FRAME_SIZE = 50
+FONT_CANDIDATES = [
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "Yu Gothic UI",
+    "Meiryo UI",
+    "Meiryo",
+    "Segoe UI",
+    "Arial",
+]
+
+TRANSPARENT_COLOR = "#010101"
+
+
+def _find_system_font(size=16):
+    if sys.platform == "win32":
+        font_dirs = [
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+        ]
+        candidate_files = [
+            "NotoSansCJKjp-Regular.otf",
+            "NotoSansJP-Regular.otf",
+            "NotoSansJP-Regular.ttf",
+            "YuGothR.ttc",
+            "YuGothM.ttc",
+            "meiryoui.ttc",
+            "meiryo.ttc",
+            "segoeui.ttf",
+            "arial.ttf",
+        ]
+        for font_file in candidate_files:
+            for font_dir in font_dirs:
+                path = os.path.join(font_dir, font_file)
+                if os.path.exists(path):
+                    try:
+                        return ImageFont.truetype(path, size)
+                    except Exception:
+                        continue
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def _get_tk_font_family():
+    for name in FONT_CANDIDATES:
+        try:
+            f = tk.font.Font(family=name, size=12)
+            if f.actual("family").lower() != "system":
+                return name
+        except Exception:
+            continue
+    return "TkDefaultFont"
+
+
+def _dominant_color(img):
+    arr = np.array(img.resize((50, 50)))
+    avg = arr.mean(axis=(0, 1)).astype(int)
+    return tuple(avg[:3])
+
+
+def _text_color_for_bg(bg_rgb):
+    luminance = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
+    return (30, 30, 30) if luminance > 128 else (230, 230, 230)
+
+
+def _first_word(text):
+    words = text.split()
+    return words[0] if words else ""
 
 
 class CaptureFrame(tk.Toplevel):
-    """Semi-transparent movable and resizable capture frame."""
+    """Transparent movable/resizable capture frame with gray border."""
 
-    def __init__(self, master):
+    def __init__(self, master, on_move=None):
         super().__init__(master)
-        self.title("Capture Area")
-        self.geometry("400x300+200+200")
-        self.attributes("-alpha", 0.3)
-        self.attributes("-topmost", True)
-        self.configure(bg="blue")
         self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.attributes("-transparentcolor", TRANSPARENT_COLOR)
+        self.configure(bg=TRANSPARENT_COLOR)
+        self.geometry("500x300+200+200")
 
+        self._on_move_cb = on_move
         self._drag_data = {"x": 0, "y": 0}
         self._resize_data = {"x": 0, "y": 0, "w": 0, "h": 0}
 
-        self.border = tk.Frame(self, bg="blue", cursor="arrow")
-        self.border.pack(fill=tk.BOTH, expand=True)
-
-        self.resize_grip = tk.Label(
-            self.border, text="◢", bg="blue", fg="white",
-            font=("Arial", 14), cursor="bottom_right_corner",
+        self.canvas = tk.Canvas(
+            self, bg=TRANSPARENT_COLOR, highlightthickness=0,
         )
-        self.resize_grip.place(relx=1.0, rely=1.0, anchor="se")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        self.border.bind("<ButtonPress-1>", self._on_drag_start)
-        self.border.bind("<B1-Motion>", self._on_drag_motion)
+        self.canvas.bind("<Configure>", self._draw_border)
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
 
-        self.resize_grip.bind("<ButtonPress-1>", self._on_resize_start)
-        self.resize_grip.bind("<B1-Motion>", self._on_resize_motion)
+    def _draw_border(self, event=None):
+        self.canvas.delete("border")
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        b = BORDER_WIDTH
+        self.canvas.create_rectangle(
+            0, 0, w, h, outline="#888888", width=b, tags="border",
+        )
+        grip_size = b + 4
+        self.canvas.create_rectangle(
+            w - grip_size, h - grip_size, w, h,
+            fill="#666666", outline="#666666", tags="border",
+        )
 
-    def _on_drag_start(self, event):
-        self._drag_data["x"] = event.x_root - self.winfo_x()
-        self._drag_data["y"] = event.y_root - self.winfo_y()
+    def _hit_zone(self, x, y):
+        w = self.winfo_width()
+        h = self.winfo_height()
+        b = BORDER_WIDTH
+        grip = b + 4
+        if x >= w - grip and y >= h - grip:
+            return "resize"
+        if x < b or y < b or x >= w - b or y >= h - b:
+            return "drag"
+        return "none"
 
-    def _on_drag_motion(self, event):
-        x = event.x_root - self._drag_data["x"]
-        y = event.y_root - self._drag_data["y"]
-        self.geometry(f"+{x}+{y}")
+    def _on_press(self, event):
+        zone = self._hit_zone(event.x, event.y)
+        self._zone = zone
+        if zone == "drag":
+            self._drag_data["x"] = event.x_root - self.winfo_x()
+            self._drag_data["y"] = event.y_root - self.winfo_y()
+        elif zone == "resize":
+            self._resize_data["x"] = event.x_root
+            self._resize_data["y"] = event.y_root
+            self._resize_data["w"] = self.winfo_width()
+            self._resize_data["h"] = self.winfo_height()
 
-    def _on_resize_start(self, event):
-        self._resize_data["x"] = event.x_root
-        self._resize_data["y"] = event.y_root
-        self._resize_data["w"] = self.winfo_width()
-        self._resize_data["h"] = self.winfo_height()
+    def _on_motion(self, event):
+        if self._zone == "drag":
+            x = event.x_root - self._drag_data["x"]
+            y = event.y_root - self._drag_data["y"]
+            self.geometry(f"+{x}+{y}")
+            if self._on_move_cb:
+                self._on_move_cb()
+        elif self._zone == "resize":
+            dx = event.x_root - self._resize_data["x"]
+            dy = event.y_root - self._resize_data["y"]
+            new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
+            new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
+            self.geometry(f"{new_w}x{new_h}")
+            if self._on_move_cb:
+                self._on_move_cb()
 
-    def _on_resize_motion(self, event):
-        dx = event.x_root - self._resize_data["x"]
-        dy = event.y_root - self._resize_data["y"]
-        new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
-        new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
-        self.geometry(f"{new_w}x{new_h}")
-
-    def get_region(self):
+    def get_inner_region(self):
         self.update_idletasks()
+        b = BORDER_WIDTH
         return {
-            "left": self.winfo_x(),
-            "top": self.winfo_y(),
-            "width": self.winfo_width(),
-            "height": self.winfo_height(),
+            "left": self.winfo_x() + b,
+            "top": self.winfo_y() + b,
+            "width": max(1, self.winfo_width() - b * 2),
+            "height": max(1, self.winfo_height() - b * 2),
         }
+
+
+class TranslationOverlay(tk.Toplevel):
+    """Overlay window that shows translated text inside the capture area."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg="#FFFFFF")
+
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self._photo = None
+        self.withdraw()
+
+    def show_translation(self, region, bg_color, text, font_size=16):
+        if not text:
+            self.withdraw()
+            return
+
+        w, h = region["width"], region["height"]
+        x, y = region["left"], region["top"]
+
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        bg_hex = "#{:02x}{:02x}{:02x}".format(*bg_color)
+        fg_color = _text_color_for_bg(bg_color)
+
+        img = Image.new("RGB", (w, h), bg_color)
+        draw = ImageDraw.Draw(img)
+        font = _find_system_font(font_size)
+
+        margin = 6
+        draw_x, draw_y = margin, margin
+        max_w = w - margin * 2
+
+        for line in text.split("\n"):
+            words = line.split()
+            current_line = ""
+            for word in words:
+                test = f"{current_line} {word}".strip()
+                bbox = draw.textbbox((0, 0), test, font=font)
+                if bbox[2] - bbox[0] > max_w and current_line:
+                    draw.text((draw_x, draw_y), current_line, fill=fg_color, font=font)
+                    draw_y += bbox[3] - bbox[1] + 4
+                    current_line = word
+                else:
+                    current_line = test
+            if current_line:
+                bbox = draw.textbbox((0, 0), current_line, font=font)
+                draw.text((draw_x, draw_y), current_line, fill=fg_color, font=font)
+                draw_y += bbox[3] - bbox[1] + 4
+
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.config(width=w, height=h)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+        self.deiconify()
+        self.lift()
+
+    def hide(self):
+        self.withdraw()
 
 
 class TranslationApp(tk.Tk):
@@ -134,19 +276,25 @@ class TranslationApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Screen Translator")
-        self.geometry("520x480")
+        self.geometry("360x160")
         self.resizable(False, False)
         self.attributes("-topmost", True)
 
         self.translator = Translator()
         self.running = False
+        self._prev_first_word = ""
+        self._lock = threading.Lock()
 
         self._build_ui()
-        self.capture_frame = CaptureFrame(self)
+        self.capture_frame = CaptureFrame(self, on_move=self._on_frame_move)
+        self.overlay = TranslationOverlay(self)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
-        settings_frame = ttk.LabelFrame(self, text="Settings", padding=10)
+        import tkinter.font as tkfont
+        self._tk_font_family = _get_tk_font_family()
+
+        settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
         settings_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(settings_frame, text="Target Language:").grid(
@@ -155,19 +303,19 @@ class TranslationApp(tk.Tk):
         self.lang_var = tk.StringVar(value="日本語")
         lang_combo = ttk.Combobox(
             settings_frame, textvariable=self.lang_var,
-            values=list(LANG_OPTIONS.keys()), state="readonly", width=20,
+            values=list(LANG_OPTIONS.keys()), state="readonly", width=18,
         )
         lang_combo.grid(row=0, column=1, padx=5, pady=2)
 
-        ttk.Label(settings_frame, text="Interval (sec):").grid(
+        ttk.Label(settings_frame, text="Font Size:").grid(
             row=1, column=0, sticky=tk.W, pady=2,
         )
-        self.interval_var = tk.StringVar(value="2")
-        interval_spin = ttk.Spinbox(
-            settings_frame, from_=1, to=30, textvariable=self.interval_var,
+        self.fontsize_var = tk.StringVar(value="16")
+        fontsize_spin = ttk.Spinbox(
+            settings_frame, from_=8, to=48, textvariable=self.fontsize_var,
             width=5,
         )
-        interval_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
+        fontsize_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
 
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -180,78 +328,72 @@ class TranslationApp(tk.Tk):
         self.status_label = ttk.Label(btn_frame, text="Stopped", foreground="gray")
         self.status_label.pack(side=tk.LEFT, padx=10)
 
-        result_frame = ttk.LabelFrame(self, text="Detected / Translated", padding=10)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        ttk.Label(result_frame, text="Original:").pack(anchor=tk.W)
-        self.original_text = tk.Text(
-            result_frame, height=5, wrap=tk.WORD, state=tk.DISABLED,
-        )
-        self.original_text.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-
-        ttk.Label(result_frame, text="Translation:").pack(anchor=tk.W)
-        self.translated_text = tk.Text(
-            result_frame, height=5, wrap=tk.WORD, state=tk.DISABLED,
-        )
-        self.translated_text.pack(fill=tk.BOTH, expand=True)
-
     def _toggle(self):
         if self.running:
             self.running = False
             self.toggle_btn.config(text="▶  Start")
             self.status_label.config(text="Stopped", foreground="gray")
+            self.overlay.hide()
+            self._prev_first_word = ""
         else:
             self.running = True
+            self._prev_first_word = ""
             self.toggle_btn.config(text="⏹  Stop")
             self.status_label.config(text="Running", foreground="green")
-            self._schedule_capture()
+            self._schedule_poll()
 
-    def _schedule_capture(self):
+    def _schedule_poll(self):
         if not self.running:
             return
-        threading.Thread(target=self._capture_and_translate, daemon=True).start()
-        interval = int(float(self.interval_var.get()) * 1000)
-        self.after(interval, self._schedule_capture)
+        threading.Thread(target=self._poll_and_translate, daemon=True).start()
+        self.after(POLL_INTERVAL_MS, self._schedule_poll)
 
-    def _capture_and_translate(self):
-        try:
-            region = self.capture_frame.get_region()
-            with mss.mss() as sct:
-                screenshot = sct.grab(region)
-            img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+    def _poll_and_translate(self):
+        with self._lock:
+            try:
+                self.overlay.after(0, self.overlay.hide)
 
-            ocr_text = pytesseract.image_to_string(img).strip()
-            if not ocr_text:
-                self._update_texts("(No text detected)", "")
-                return
+                import time
+                time.sleep(0.05)
 
-            target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
-            result = self.translator.translate(ocr_text, dest=target_code)
-            src_lang = LANGUAGES.get(result.src.lower(), result.src)
-            translated = result.text
+                region = self.capture_frame.get_inner_region()
+                with mss.mss() as sct:
+                    screenshot = sct.grab(region)
+                img = Image.frombytes(
+                    "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
+                )
 
-            self._update_texts(
-                f"[{src_lang}]\n{ocr_text}",
-                f"[{LANGUAGES.get(target_code, target_code)}]\n{translated}",
-            )
-        except Exception as e:
-            self._update_texts(f"Error: {e}", "")
+                ocr_text = pytesseract.image_to_string(img).strip()
+                if not ocr_text:
+                    self._prev_first_word = ""
+                    return
 
-    def _update_texts(self, original, translated):
-        def _update():
-            self.original_text.config(state=tk.NORMAL)
-            self.original_text.delete("1.0", tk.END)
-            self.original_text.insert(tk.END, original)
-            self.original_text.config(state=tk.DISABLED)
+                current_first = _first_word(ocr_text)
+                if current_first == self._prev_first_word:
+                    return
 
-            self.translated_text.config(state=tk.NORMAL)
-            self.translated_text.delete("1.0", tk.END)
-            self.translated_text.insert(tk.END, translated)
-            self.translated_text.config(state=tk.DISABLED)
-        self.after(0, _update)
+                self._prev_first_word = current_first
+                bg_color = _dominant_color(img)
+                target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
+                result = self.translator.translate(ocr_text, dest=target_code)
+                translated = result.text
+
+                font_size = int(self.fontsize_var.get())
+                self.overlay.after(
+                    0,
+                    self.overlay.show_translation,
+                    region, bg_color, translated, font_size,
+                )
+            except Exception:
+                pass
+
+    def _on_frame_move(self):
+        if self.running:
+            self.overlay.hide()
 
     def _on_close(self):
         self.running = False
+        self.overlay.destroy()
         self.capture_frame.destroy()
         self.destroy()
 
