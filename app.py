@@ -514,58 +514,50 @@ def _wrap_text(text, font, max_w, draw):
 def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
-    font = _find_system_font(font_size)
-    line_spacing = int(font_size * 0.35)
+    line_spacing = int(font_size * 0.3)
 
-    block_renders = []
     for block, translated in zip(blocks, translations):
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+        bg_color, fg_color = _region_colors(base_img, x, y, w, h)
 
-        margin = 4
+        draw.rectangle([x, y, x + w, y + h], fill=bg_color)
+
+        margin = 3
         max_w = w - margin * 2
+
+        fs = font_size
+        font = _find_system_font(fs)
         wrapped = _wrap_text(translated, font, max_w, draw)
 
         total_h = margin * 2
         for line in wrapped:
             if not line:
-                total_h += font_size // 2
+                total_h += fs // 2
             else:
                 bbox = draw.textbbox((0, 0), line, font=font)
                 total_h += bbox[3] - bbox[1] + line_spacing
 
-        render_h = max(h, total_h)
+        while total_h > h and fs > 8:
+            fs -= 1
+            font = _find_system_font(fs)
+            wrapped = _wrap_text(translated, font, max_w, draw)
+            total_h = margin * 2
+            for line in wrapped:
+                if not line:
+                    total_h += fs // 2
+                else:
+                    bbox = draw.textbbox((0, 0), line, font=font)
+                    total_h += bbox[3] - bbox[1] + line_spacing
 
-        block_renders.append({
-            "x": x, "y": y, "w": w, "h": render_h,
-            "wrapped": wrapped, "margin": margin,
-        })
-
-    for i in range(len(block_renders) - 1):
-        cur = block_renders[i]
-        nxt = block_renders[i + 1]
-        cur_bottom = cur["y"] + cur["h"]
-        if cur_bottom > nxt["y"]:
-            shift = cur_bottom - nxt["y"] + 4
-            for j in range(i + 1, len(block_renders)):
-                block_renders[j]["y"] += shift
-
-    for i, br in enumerate(block_renders):
-        x, y, w, h = br["x"], br["y"], br["w"], br["h"]
-        orig_block = blocks[i]
-        ox, oy = orig_block["x"], orig_block["y"]
-        ow, oh = orig_block["w"], orig_block["h"]
-        bg_color, fg_color = _region_colors(base_img, ox, oy, ow, oh)
-
-        draw.rectangle([x, y, x + w, y + h], fill=bg_color)
-
-        margin = br["margin"]
         dy = y + margin
-        for line in br["wrapped"]:
+        for line in wrapped:
             if not line:
-                dy += font_size // 2
+                dy += fs // 2
                 continue
             bbox = draw.textbbox((0, 0), line, font=font)
             line_h = bbox[3] - bbox[1] + line_spacing
+            if dy + line_h > y + h:
+                break
             draw.text((x + margin, dy), line, fill=fg_color, font=font)
             dy += line_h
 
