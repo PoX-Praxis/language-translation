@@ -3,9 +3,11 @@ Screen Translation Overlay App
 - Captures text within a movable/resizable overlay frame
 - Detects the source language and translates to a selected target language
 - Displays translated text directly inside the capture frame
+- Supports Google Translate and local LLM (Ollama) as translation engines
 - Auto-translates when text changes; click overlay to dismiss
 """
 
+import json
 import os
 import sys
 import threading
@@ -13,6 +15,8 @@ import time
 import tkinter as tk
 from tkinter import ttk
 import traceback
+import urllib.request
+import urllib.error
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -44,9 +48,93 @@ LANG_OPTIONS = {
     "ไทย": "th",
 }
 
+LANG_NAMES_NATIVE = {v: k for k, v in LANG_OPTIONS.items()}
+
 BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
 
+ENGINE_GOOGLE = "Google Translate"
+ENGINE_OLLAMA = "Ollama (Local LLM)"
+
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "qwen2.5"
+
+
+# ---------------------------------------------------------------------------
+# Translation engines
+# ---------------------------------------------------------------------------
+
+class GoogleTranslateEngine:
+    def __init__(self):
+        self._translator = Translator()
+
+    def translate(self, text, target_code):
+        result = self._translator.translate(text, dest=target_code)
+        src_lang = LANGUAGES.get(result.src.lower(), result.src)
+        return result.text, src_lang
+
+
+class OllamaEngine:
+    def __init__(self, base_url=DEFAULT_OLLAMA_URL, model=DEFAULT_OLLAMA_MODEL):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def translate(self, text, target_code):
+        target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
+        prompt = (
+            f"Translate the following text into {target_name}. "
+            f"Output ONLY the translated text, nothing else. "
+            f"Do not add explanations, notes, or quotation marks.\n\n"
+            f"{text}"
+        )
+
+        payload = json.dumps({
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+            },
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self.base_url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+
+        translated = body.get("response", "").strip()
+        return translated, "auto"
+
+    @staticmethod
+    def list_models(base_url=DEFAULT_OLLAMA_URL):
+        try:
+            req = urllib.request.Request(
+                f"{base_url.rstrip('/')}/api/tags",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            return [m["name"] for m in body.get("models", [])]
+        except Exception:
+            return []
+
+    @staticmethod
+    def is_available(base_url=DEFAULT_OLLAMA_URL):
+        try:
+            req = urllib.request.Request(f"{base_url.rstrip('/')}/api/tags")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
 
 def _find_system_font(size=16):
     if sys.platform == "win32":
@@ -102,11 +190,6 @@ _SENTENCE_ENDINGS = set("。.!?！？;；:：」』)）】》…")
 
 
 def _join_hard_wraps(text):
-    """Join hard-wrapped lines while preserving paragraph breaks.
-
-    Lines not ending with sentence-ending punctuation are joined with
-    the next line. Empty lines are treated as paragraph separators.
-    """
     raw_lines = text.split("\n")
     paragraphs = []
     current = []
@@ -134,9 +217,11 @@ def _join_hard_wraps(text):
     return "\n".join(paragraphs)
 
 
-class CaptureFrame(tk.Toplevel):
-    """Movable/resizable capture frame with gray border and transparent center."""
+# ---------------------------------------------------------------------------
+# GUI components
+# ---------------------------------------------------------------------------
 
+class CaptureFrame(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.overrideredirect(True)
@@ -215,8 +300,6 @@ class CaptureFrame(tk.Toplevel):
 
 
 class TranslationOverlay(tk.Toplevel):
-    """Independent overlay window that shows translated text."""
-
     def __init__(self, master, on_click=None):
         super().__init__(master)
         self.overrideredirect(True)
@@ -304,17 +387,21 @@ def _render_text_image(w, h, bg_color, fg_color, text, font_size):
     return img
 
 
-class TranslationApp(tk.Tk):
-    """Main control panel for screen translation."""
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 
+class TranslationApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Screen Translator")
-        self.geometry("420x220")
+        self.geometry("450x320")
         self.resizable(False, False)
         self.attributes("-topmost", True)
 
-        self.translator = Translator()
+        self._google_engine = GoogleTranslateEngine()
+        self._ollama_engine = None
+
         self.running = False
         self._lock = threading.Lock()
         self._prev_first_word = None
@@ -328,9 +415,61 @@ class TranslationApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._check_ollama_status()
+
     def _build_ui(self):
+        # --- Engine settings ---
+        engine_frame = ttk.LabelFrame(self, text="Translation Engine", padding=8)
+        engine_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
+
+        self.engine_var = tk.StringVar(value=ENGINE_GOOGLE)
+        engine_combo = ttk.Combobox(
+            engine_frame, textvariable=self.engine_var,
+            values=[ENGINE_GOOGLE, ENGINE_OLLAMA],
+            state="readonly", width=22,
+        )
+        engine_combo.grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
+        engine_combo.bind("<<ComboboxSelected>>", self._on_engine_change)
+
+        self.ollama_frame = ttk.Frame(engine_frame)
+        self.ollama_frame.grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=2,
+        )
+
+        ttk.Label(self.ollama_frame, text="URL:").grid(
+            row=0, column=0, sticky=tk.W,
+        )
+        self.ollama_url_var = tk.StringVar(value=DEFAULT_OLLAMA_URL)
+        url_entry = ttk.Entry(
+            self.ollama_frame, textvariable=self.ollama_url_var, width=25,
+        )
+        url_entry.grid(row=0, column=1, padx=5)
+
+        ttk.Label(self.ollama_frame, text="Model:").grid(
+            row=1, column=0, sticky=tk.W,
+        )
+        self.ollama_model_var = tk.StringVar(value=DEFAULT_OLLAMA_MODEL)
+        self.model_combo = ttk.Combobox(
+            self.ollama_frame, textvariable=self.ollama_model_var, width=22,
+        )
+        self.model_combo.grid(row=1, column=1, padx=5, pady=2)
+
+        self.refresh_btn = ttk.Button(
+            self.ollama_frame, text="Refresh", width=8,
+            command=self._refresh_models,
+        )
+        self.refresh_btn.grid(row=1, column=2, padx=2)
+
+        self.ollama_status = ttk.Label(
+            self.ollama_frame, text="", foreground="gray",
+        )
+        self.ollama_status.grid(row=2, column=0, columnspan=3, sticky=tk.W)
+
+        self.ollama_frame.grid_remove()
+
+        # --- Translation settings ---
         settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
-        settings_frame.pack(fill=tk.X, padx=10, pady=5)
+        settings_frame.pack(fill=tk.X, padx=10, pady=2)
 
         ttk.Label(settings_frame, text="Target Language:").grid(
             row=0, column=0, sticky=tk.W, pady=2,
@@ -352,6 +491,7 @@ class TranslationApp(tk.Tk):
         )
         fontsize_spin.grid(row=1, column=1, sticky=tk.W, padx=5, pady=2)
 
+        # --- Controls ---
         btn_frame = ttk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
@@ -372,9 +512,63 @@ class TranslationApp(tk.Tk):
         self.status_label.pack(side=tk.LEFT, padx=10)
 
         self.info_label = ttk.Label(
-            self, text="", foreground="blue", wraplength=400,
+            self, text="", foreground="blue", wraplength=430,
         )
         self.info_label.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+    # --- Engine management ---
+
+    def _on_engine_change(self, event=None):
+        if self.engine_var.get() == ENGINE_OLLAMA:
+            self.ollama_frame.grid()
+            self.geometry("450x420")
+            self._check_ollama_status()
+        else:
+            self.ollama_frame.grid_remove()
+            self.geometry("450x320")
+
+    def _check_ollama_status(self):
+        def _check():
+            url = self.ollama_url_var.get()
+            if OllamaEngine.is_available(url):
+                models = OllamaEngine.list_models(url)
+                self.after(0, lambda: self._update_ollama_ui(True, models))
+            else:
+                self.after(0, lambda: self._update_ollama_ui(False, []))
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _update_ollama_ui(self, available, models):
+        if available:
+            self.ollama_status.config(
+                text=f"Connected ({len(models)} models)",
+                foreground="green",
+            )
+            self.model_combo["values"] = models
+            if models and not self.ollama_model_var.get():
+                self.ollama_model_var.set(models[0])
+        else:
+            self.ollama_status.config(
+                text="Not connected - is Ollama running?",
+                foreground="red",
+            )
+            self.model_combo["values"] = []
+
+    def _refresh_models(self):
+        self.ollama_status.config(text="Checking...", foreground="gray")
+        self._check_ollama_status()
+
+    def _get_engine(self):
+        if self.engine_var.get() == ENGINE_OLLAMA:
+            url = self.ollama_url_var.get()
+            model = self.ollama_model_var.get()
+            if self._ollama_engine is None or \
+               self._ollama_engine.base_url != url.rstrip("/") or \
+               self._ollama_engine.model != model:
+                self._ollama_engine = OllamaEngine(url, model)
+            return self._ollama_engine
+        return self._google_engine
+
+    # --- Status ---
 
     def _set_status(self, text, color="blue"):
         self.after(
@@ -382,6 +576,8 @@ class TranslationApp(tk.Tk):
                 text=t, foreground=c,
             ),
         )
+
+    # --- Start / Stop ---
 
     def _toggle(self):
         if self.running:
@@ -405,7 +601,9 @@ class TranslationApp(tk.Tk):
         if not self.running:
             return
         if not self.overlay.is_visible:
-            threading.Thread(target=self._scan_and_translate, daemon=True).start()
+            threading.Thread(
+                target=self._scan_and_translate, daemon=True,
+            ).start()
         self.after(1000, self._poll)
 
     def _manual_translate(self):
@@ -414,11 +612,15 @@ class TranslationApp(tk.Tk):
         self.overlay.hide()
         self._prev_first_word = None
         self._set_status("Translating...")
-        threading.Thread(target=self._scan_and_translate, daemon=True).start()
+        threading.Thread(
+            target=self._scan_and_translate, daemon=True,
+        ).start()
 
     def _on_overlay_click(self):
         self._prev_first_word = None
         self._set_status("Dismissed. Rescanning...")
+
+    # --- Core translation ---
 
     def _scan_and_translate(self):
         if not self._lock.acquire(blocking=False):
@@ -441,24 +643,26 @@ class TranslationApp(tk.Tk):
 
             current_first = _first_word(ocr_text)
 
-            if self._prev_first_word is not None and current_first == self._prev_first_word:
+            if (self._prev_first_word is not None
+                    and current_first == self._prev_first_word):
                 return
 
             self._set_status(f"Translating: {ocr_text[:50]}...")
 
             bg_color = _dominant_color(img)
             target_code = LANG_OPTIONS.get(self.lang_var.get(), "en")
-            result = self.translator.translate(ocr_text, dest=target_code)
-            translated = result.text
+
+            engine = self._get_engine()
+            translated, src_lang = engine.translate(ocr_text, target_code)
 
             self._prev_first_word = current_first
             self._prev_translated = translated
             self._prev_bg_color = bg_color
 
-            src_lang = LANGUAGES.get(result.src.lower(), result.src)
+            engine_name = self.engine_var.get().split(" ")[0]
+            target_name = LANGUAGES.get(target_code, target_code)
             self._set_status(
-                f"[{src_lang}] → "
-                f"[{LANGUAGES.get(target_code, target_code)}]",
+                f"[{engine_name}] [{src_lang}] → [{target_name}]",
             )
 
             fg_color = _text_color_for_bg(bg_color)
@@ -472,6 +676,10 @@ class TranslationApp(tk.Tk):
                 0,
                 self.overlay.show_at,
                 region["left"], region["top"], w, h, text_img,
+            )
+        except urllib.error.URLError:
+            self._set_status(
+                "Ollama connection failed - is it running?", "red",
             )
         except Exception as e:
             self._set_status(f"Error: {e}", "red")
