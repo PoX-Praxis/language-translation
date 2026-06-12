@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import mss
 import pytesseract
-from googletrans import Translator, LANGUAGES
+import urllib.parse
 
 if sys.platform == "win32":
     _default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -65,13 +65,26 @@ DEFAULT_OLLAMA_MODEL = "translator"
 # ---------------------------------------------------------------------------
 
 class GoogleTranslateEngine:
-    def __init__(self):
-        self._translator = Translator()
+    _TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
     def translate(self, text, target_code):
-        result = self._translator.translate(text, dest=target_code)
-        src_lang = LANGUAGES.get(result.src.lower(), result.src)
-        return result.text, src_lang
+        params = urllib.parse.urlencode({
+            "client": "gtx",
+            "sl": "auto",
+            "tl": target_code,
+            "dt": "t",
+            "q": text,
+        })
+        url = f"{self._TRANSLATE_URL}?{params}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        translated = "".join(seg[0] for seg in data[0] if seg[0])
+        src_lang = data[2] if len(data) > 2 else "auto"
+        return translated, src_lang
 
 
 class OllamaEngine:
@@ -775,7 +788,7 @@ class TranslationApp(tk.Tk):
             self._prev_bg_color = bg_color
 
             engine_name = self.engine_var.get().split(" ")[0]
-            target_name = LANGUAGES.get(target_code, target_code)
+            target_name = LANG_NAMES_NATIVE.get(target_code, target_code)
             self._set_status(
                 f"[{engine_name}] [{src_lang}] → [{target_name}]",
             )
