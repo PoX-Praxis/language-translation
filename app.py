@@ -15,6 +15,14 @@ import mss
 import pytesseract
 from googletrans import Translator, LANGUAGES
 
+import os
+import sys
+
+if sys.platform == "win32":
+    _default_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(_default_path):
+        pytesseract.pytesseract.tesseract_cmd = _default_path
+
 
 LANG_OPTIONS = {
     "日本語": "ja",
