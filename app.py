@@ -19,12 +19,31 @@ import urllib.error
 import urllib.parse
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageTk
 import mss
 import pytesseract
 
 APP_NAME = "Screen Translator"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
+
+# ---------------------------------------------------------------------------
+# OCR settings (all tunable constants)
+# ---------------------------------------------------------------------------
+
+# --- Phase 1: Image preprocessing ---
+OCR_UPSCALE = 2.5
+OCR_CONTRAST = 1.6
+
+# --- Phase 2: Tesseract config ---
+TESS_PSM = 6    # 3=auto, 6=single block, 11=sparse text
+TESS_OEM = 1    # 1=LSTM only
+TESS_LANG = "jpn+eng"
+
+# --- Phase 3: conf threshold / local LLM ---
+CONF_THRESHOLD = 60
+SMALL_CHAR_PX = 14
+MAX_LLM_BLOCKS = 3
+LOCAL_OCR_MODEL = "got-ocr2"
 
 # ---------------------------------------------------------------------------
 # Config / Tesseract detection
@@ -84,7 +103,65 @@ BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
 TOOLBAR_HEIGHT = 28
 
-DEEPL_API_KEY = "d4ba5dbe-ef4e-4735-bca2-3268722e0ecb:fx"
+def _get_config_path():
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~")
+    return os.path.join(base, "ScreenTranslator", "config.json")
+
+
+def _load_api_key():
+    env_key = os.environ.get("DEEPL_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    config_path = _get_config_path()
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            key = cfg.get("deepl_api_key", "").strip()
+            if key:
+                return key
+        except Exception:
+            pass
+
+    return ""
+
+
+def _save_api_key(key):
+    config_path = _get_config_path()
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    cfg = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    cfg["deepl_api_key"] = key
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _ask_api_key():
+    import tkinter.simpledialog as sd
+    root = tk.Tk()
+    root.withdraw()
+    key = sd.askstring(
+        APP_NAME,
+        "DeepL API Key を入力してください:\n\n"
+        "https://www.deepl.com/pro-api で取得できます（無料プランあり）",
+        parent=root,
+    )
+    root.destroy()
+    if key and key.strip():
+        key = key.strip()
+        _save_api_key(key)
+        return key
+    return ""
+
 
 DEEPL_LANG_MAP = {
     "ja": "JA", "en": "EN", "zh-cn": "ZH", "ko": "KO",
@@ -161,6 +238,48 @@ def _find_system_font(size=16):
         return ImageFont.truetype("arial.ttf", size)
     except Exception:
         return ImageFont.load_default()
+
+
+def _otsu_threshold(gray_arr):
+    hist, _ = np.histogram(gray_arr.ravel(), bins=256, range=(0, 256))
+    total = gray_arr.size
+    sum_total = np.dot(np.arange(256), hist)
+    sum_bg = 0.0
+    w_bg = 0
+    max_var = 0.0
+    threshold = 0
+    for t in range(256):
+        w_bg += hist[t]
+        if w_bg == 0:
+            continue
+        w_fg = total - w_bg
+        if w_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / w_bg
+        mean_fg = (sum_total - sum_bg) / w_fg
+        var_between = w_bg * w_fg * (mean_bg - mean_fg) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            threshold = t
+    return threshold
+
+
+def _preprocess_for_ocr(pil_img):
+    w, h = pil_img.size
+    new_w = int(w * OCR_UPSCALE)
+    new_h = int(h * OCR_UPSCALE)
+    upscaled = pil_img.resize((new_w, new_h), Image.LANCZOS)
+
+    gray = upscaled.convert("L")
+
+    enhanced = ImageEnhance.Contrast(gray).enhance(OCR_CONTRAST)
+
+    arr = np.array(enhanced)
+    thresh = _otsu_threshold(arr)
+    binary = ((arr > thresh) * 255).astype(np.uint8)
+
+    return Image.fromarray(binary)
 
 
 def _dominant_color(img):
@@ -475,9 +594,11 @@ class Toolbar(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
 
-def _extract_text_blocks(gray_img):
+def _extract_text_blocks(ocr_img, scale=1.0):
+    tess_config = f"--oem {TESS_OEM} --psm {TESS_PSM}"
     data = pytesseract.image_to_data(
-        gray_img, output_type=pytesseract.Output.DICT,
+        ocr_img, lang=TESS_LANG, config=tess_config,
+        output_type=pytesseract.Output.DICT,
     )
     blocks = {}
     n = len(data["text"])
@@ -496,6 +617,7 @@ def _extract_text_blocks(gray_img):
                 "words": [],
                 "lines": {},
                 "word_heights": [],
+                "confs": [],
             }
         b = blocks[block_id]
         b["x"] = min(b["x"], data["left"][i])
@@ -504,10 +626,13 @@ def _extract_text_blocks(gray_img):
         b["y2"] = max(b["y2"], data["top"][i] + data["height"][i])
         b["words"].append(text)
         b["word_heights"].append(data["height"][i])
+        b["confs"].append(conf)
         line_id = data["line_num"][i]
         if line_id not in b["lines"]:
             b["lines"][line_id] = []
         b["lines"][line_id].append(text)
+
+    inv_scale = 1.0 / scale
 
     result = []
     for bid in sorted(blocks.keys()):
@@ -520,15 +645,21 @@ def _extract_text_blocks(gray_img):
         if not full_text.strip():
             continue
         avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
+        median_conf = int(np.median(b["confs"])) if b["confs"] else 0
         pad_x = 6
         pad_y = 4
+        raw_x = b["x"]
+        raw_y = b["y"]
+        raw_w = b["x2"] - b["x"]
+        raw_h = b["y2"] - b["y"]
         result.append({
-            "x": max(0, b["x"] - pad_x),
-            "y": max(0, b["y"] - pad_y),
-            "w": b["x2"] - b["x"] + pad_x * 2,
-            "h": b["y2"] - b["y"] + pad_y * 2,
+            "x": max(0, int(raw_x * inv_scale) - pad_x),
+            "y": max(0, int(raw_y * inv_scale) - pad_y),
+            "w": int(raw_w * inv_scale) + pad_x * 2,
+            "h": int(raw_h * inv_scale) + pad_y * 2,
             "text": full_text,
-            "median_char_h": avg_h,
+            "median_char_h": int(avg_h * inv_scale),
+            "median_conf": median_conf,
         })
     return result
 
@@ -615,7 +746,14 @@ class ScreenTranslator(tk.Tk):
         super().__init__()
         self.withdraw()
 
-        self._engine = DeepLEngine(DEEPL_API_KEY)
+        api_key = _load_api_key()
+        if not api_key:
+            api_key = _ask_api_key()
+        if not api_key:
+            messagebox.showerror(APP_NAME, "DeepL API Key が未設定です。終了します。")
+            self.destroy()
+            return
+        self._engine = DeepLEngine(api_key)
 
         self.running = False
         self._lock = threading.Lock()
@@ -703,8 +841,8 @@ class ScreenTranslator(tk.Tk):
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
             )
 
-            gray = img.convert("L")
-            blocks = _extract_text_blocks(gray)
+            ocr_img = _preprocess_for_ocr(img)
+            blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
             if not blocks:
                 self._prev_first_word = None
