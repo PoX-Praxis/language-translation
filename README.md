@@ -25,7 +25,7 @@
 #### 必要条件
 
 - Python 3.9+
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)（日本語データ含む、下記参照）
 - [DeepL API Key](https://www.deepl.com/pro-api)（Free plan可）
 
 ```bash
@@ -33,15 +33,24 @@ pip install -r requirements.txt
 python app.py
 ```
 
+#### Tesseract 日本語OCRデータの導入
+
+日本語を含む画面をOCRするには `jpn` 言語データが必要です。
+
+- **Windowsインストーラ**: インストール時に「Additional language data」で「Japanese」にチェック
+- **手動**: [tessdata](https://github.com/tesseract-ocr/tessdata) から `jpn.traineddata` をダウンロードし、Tesseractの `tessdata` フォルダに配置
+
 ## 初回セットアップ
 
-初回起動時にDeepL APIキーの入力画面が表示されます。
+### DeepL APIキーの設定
 
-1. [DeepL API](https://www.deepl.com/pro-api) でアカウント作成（無料プランあり）
-2. APIキーをコピー
-3. 入力画面に貼り付けてOK
+以下の優先順で読み込まれます:
 
-設定は `%APPDATA%\ScreenTranslator\config.json` に保存されます。
+1. 環境変数 `DEEPL_API_KEY`
+2. 設定ファイル `%APPDATA%\ScreenTranslator\config.json` の `deepl_api_key`
+3. どちらも未設定の場合、初回起動時に入力ダイアログが表示されます
+
+入力したキーは `%APPDATA%\ScreenTranslator\config.json` に保存されます。
 
 ## 使い方
 
@@ -70,8 +79,26 @@ build.bat
 2. `build.bat` でexeをビルド
 3. Inno Setupで `installer.iss` をコンパイル
 
+## ローカルLLM OCR（オプション・上級者向け）
+
+Tesseractの認識精度が低いブロックを、ローカルVLM（GOT-OCR2.0）で自動的に再OCRする機能です。GPU推奨。
+
+### 有効化
+
+```bash
+pip install torch transformers accelerate
+```
+
+インストール後、自動的に有効化されます。未インストールの場合はTesseractのみで動作します。
+
+### GPU要件
+
+- CUDA対応GPU（VRAM 4GB以上推奨）
+- CPUでも動作しますが低速です
+
 ## 注意事項
 
+- OCR前処理（拡大・二値化）により小さい文字の認識精度が向上しています
 - Tesseract OCRの認識精度はフォントや解像度に依存します
 - 翻訳にはインターネット接続が必要です（DeepL API使用）
 - DeepL Free APIは月50万文字まで無料です

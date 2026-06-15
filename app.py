@@ -844,6 +844,8 @@ class ScreenTranslator(tk.Tk):
             ocr_img = _preprocess_for_ocr(img)
             blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
+            blocks = self._refine_low_conf_blocks(blocks, img)
+
             if not blocks:
                 self._prev_first_word = None
                 return
@@ -895,6 +897,41 @@ class ScreenTranslator(tk.Tk):
             traceback.print_exc()
         finally:
             self._lock.release()
+
+    def _refine_low_conf_blocks(self, blocks, original_img):
+        try:
+            from local_ocr import is_available, local_ocr_image
+            if not is_available():
+                return blocks
+        except ImportError:
+            return blocks
+
+        candidates = []
+        for i, b in enumerate(blocks):
+            needs_reocr = (
+                b["median_conf"] < CONF_THRESHOLD
+                or b["median_char_h"] < SMALL_CHAR_PX
+            )
+            if needs_reocr:
+                candidates.append((i, b["median_conf"]))
+
+        candidates.sort(key=lambda x: x[1])
+        candidates = candidates[:MAX_LLM_BLOCKS]
+
+        for idx, _ in candidates:
+            b = blocks[idx]
+            x, y, w, h = b["x"], b["y"], b["w"], b["h"]
+            iw, ih = original_img.size
+            crop_box = (
+                max(0, x), max(0, y),
+                min(iw, x + w), min(ih, y + h),
+            )
+            crop = original_img.crop(crop_box)
+            result = local_ocr_image(crop)
+            if result:
+                blocks[idx]["text"] = result
+
+        return blocks
 
     def _on_close(self):
         self.running = False
