@@ -66,7 +66,7 @@ STILL_MAX_LLM_BLOCKS = 10
 PDF_TEXT_MIN_CHARS = 20
 
 # --- Phase 6: UI Automation ---
-UIA_ENABLED = True
+UIA_ENABLED = False  # disabled: picks up desktop/explorer elements instead of target content
 UIA_MIN_ELEMENTS = 1
 UIA_TIMEOUT_MS = 200
 
