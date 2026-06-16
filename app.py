@@ -341,7 +341,16 @@ def _region_colors(img, x, y, w, h):
     else:
         fg = _text_color_for_bg(bg)
 
-    return bg, fg
+    return bg, _boost_fg(fg)
+
+
+def _boost_fg(fg):
+    luminance = 0.299 * fg[0] + 0.587 * fg[1] + 0.114 * fg[2]
+    if luminance > 128:
+        factor = 0.7
+    else:
+        factor = 1.3
+    return tuple(max(0, min(255, int(c * factor))) for c in fg)
 
 
 def _text_color_for_bg(bg_rgb):
