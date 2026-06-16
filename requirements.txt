@@ -3,12 +3,6 @@ pytesseract>=0.3.10
 mss>=9.0.0
 numpy>=1.24.0
 
-# Optional: PDF text extraction (Phase 5)
-# PyMuPDF>=1.23.0
-
-# Optional: UI Automation (Phase 6, Windows only)
-# uiautomation>=2.0.0
-
 # Optional: Local VLM OCR (Phase 3) — requires GPU for practical speed
 # torch>=2.0.0
 # transformers>=4.37.0

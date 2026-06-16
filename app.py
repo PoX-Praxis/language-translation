@@ -25,7 +25,7 @@ import mss
 import pytesseract
 
 APP_NAME = "Screen Translator"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # OCR settings (all tunable constants)
@@ -56,19 +56,6 @@ MIN_FONT_PX = 9
 MAX_FONT_PX = 48
 BOX_PADDING_PX = 2
 LINE_SPACING_RATIO = 1.1
-
-# --- Phase 5: Mode separation ---
-DEFAULT_MODE = "RT"  # "RT" (game/realtime) or "STILL" (PDF/image)
-RT_CONF_THRESHOLD = 50
-RT_MAX_LLM_BLOCKS = 1
-STILL_CONF_THRESHOLD = 75
-STILL_MAX_LLM_BLOCKS = 10
-PDF_TEXT_MIN_CHARS = 20
-
-# --- Phase 6: UI Automation ---
-UIA_ENABLED = True
-UIA_MIN_ELEMENTS = 1
-UIA_TIMEOUT_MS = 200
 
 # ---------------------------------------------------------------------------
 # Config / Tesseract detection
@@ -542,14 +529,6 @@ class Toolbar(tk.Toplevel):
         f = tk.Frame(self, bg="#444444")
         f.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        self.mode_var = tk.StringVar(value=DEFAULT_MODE)
-        mode_combo = ttk.Combobox(
-            f, textvariable=self.mode_var,
-            values=["RT", "STILL"], state="readonly", width=5,
-            font=("", 8),
-        )
-        mode_combo.pack(side=tk.LEFT, padx=1)
-
         self.lang_var = tk.StringVar(value="日本語")
         lang_combo = ttk.Combobox(
             f, textvariable=self.lang_var,
@@ -907,13 +886,11 @@ class ScreenTranslator(tk.Tk):
     def _poll(self):
         if not self.running:
             return
-        mode = self.toolbar.mode_var.get()
         if not self.overlay.is_visible:
             threading.Thread(
                 target=self._scan_and_translate, daemon=True,
             ).start()
-        if mode == "RT":
-            self.after(1000, self._poll)
+        self.after(1000, self._poll)
 
     def _manual_translate(self):
         if not self.running:
@@ -940,27 +917,6 @@ class ScreenTranslator(tk.Tk):
 
     # --- Core translation ---
 
-    def _get_mode_params(self):
-        mode = self.toolbar.mode_var.get()
-        if mode == "STILL":
-            return STILL_CONF_THRESHOLD, STILL_MAX_LLM_BLOCKS
-        return RT_CONF_THRESHOLD, RT_MAX_LLM_BLOCKS
-
-    def _try_uia_extract(self, region):
-        try:
-            from uia_extract import is_available, extract_text_from_region
-            if not is_available():
-                return None
-            blocks = extract_text_from_region(
-                region["left"], region["top"],
-                region["width"], region["height"],
-            )
-            return blocks
-        except ImportError:
-            return None
-        except Exception:
-            return None
-
     def _scan_and_translate(self):
         if not self._lock.acquire(blocking=False):
             return
@@ -972,19 +928,10 @@ class ScreenTranslator(tk.Tk):
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
             )
 
-            blocks = None
+            ocr_img = _preprocess_for_ocr(img)
+            blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
-            if UIA_ENABLED:
-                blocks = self._try_uia_extract(region)
-
-            if not blocks:
-                ocr_img = _preprocess_for_ocr(img)
-                blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
-
-            conf_thresh, max_llm = self._get_mode_params()
-            blocks = self._refine_low_conf_blocks(
-                blocks, img, conf_thresh, max_llm,
-            )
+            blocks = self._refine_low_conf_blocks(blocks, img)
 
             if not blocks:
                 self._prev_first_word = None
@@ -1057,9 +1004,7 @@ class ScreenTranslator(tk.Tk):
         finally:
             self._lock.release()
 
-    def _refine_low_conf_blocks(self, blocks, original_img,
-                                conf_threshold=CONF_THRESHOLD,
-                                max_llm_blocks=MAX_LLM_BLOCKS):
+    def _refine_low_conf_blocks(self, blocks, original_img):
         try:
             from local_ocr import is_available, local_ocr_image
             if not is_available():
@@ -1070,14 +1015,14 @@ class ScreenTranslator(tk.Tk):
         candidates = []
         for i, b in enumerate(blocks):
             needs_reocr = (
-                b["median_conf"] < conf_threshold
+                b["median_conf"] < CONF_THRESHOLD
                 or b["median_char_h"] < SMALL_CHAR_PX
             )
             if needs_reocr:
                 candidates.append((i, b["median_conf"]))
 
         candidates.sort(key=lambda x: x[1])
-        candidates = candidates[:max_llm_blocks]
+        candidates = candidates[:MAX_LLM_BLOCKS]
 
         for idx, _ in candidates:
             b = blocks[idx]
