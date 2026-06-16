@@ -331,7 +331,11 @@ def _region_colors(img, x, y, w, h):
         dists = np.linalg.norm(flat.astype(float) - bg_arr.astype(float), axis=1)
         far_mask = dists > 30
         if far_mask.sum() > 10:
-            fg = tuple(np.median(flat[far_mask], axis=0).astype(int)[:3])
+            far_pixels = flat[far_mask]
+            far_dists = dists[far_mask]
+            top_n = max(1, len(far_dists) // 5)
+            top_indices = np.argsort(far_dists)[-top_n:]
+            fg = tuple(np.median(far_pixels[top_indices], axis=0).astype(int)[:3])
         else:
             fg = _text_color_for_bg(bg)
     else:
