@@ -36,7 +36,7 @@ OCR_UPSCALE = 2.5
 OCR_CONTRAST = 1.6
 
 # --- Phase 2: Tesseract config ---
-TESS_PSM = 6    # 3=auto, 6=single block, 11=sparse text
+TESS_PSM = 3    # 3=auto, 6=single block, 11=sparse text
 TESS_OEM = 1    # 1=LSTM only
 TESS_LANG = "jpn+eng"
 
