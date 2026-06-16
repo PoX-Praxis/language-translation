@@ -228,6 +228,8 @@ def _find_system_font(size=16):
             ),
         ]
         candidate_files = [
+            "BIZ-UDPGothicR.ttc",
+            "BIZUDPGothic-Regular.ttc",
             "NotoSansCJKjp-Regular.otf",
             "NotoSansJP-Regular.otf",
             "NotoSansJP-Regular.ttf",
