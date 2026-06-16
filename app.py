@@ -9,6 +9,7 @@ Screen Translator
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import threading
 import tkinter as tk
@@ -44,6 +45,17 @@ CONF_THRESHOLD = 60
 SMALL_CHAR_PX = 14
 MAX_LLM_BLOCKS = 3
 LOCAL_OCR_MODEL = "got-ocr2"
+
+# --- Phase 4: Chart detection & rendering ---
+ENABLE_CHART_DETECTION = True
+PROTECT_NUMERIC = True
+NUMERIC_UNITS = ("trn", "tn", "bn", "mn", "k", "tm", "%")
+
+# --- Rendering box / auto-fit ---
+MIN_FONT_PX = 9
+MAX_FONT_PX = 48
+BOX_PADDING_PX = 2
+LINE_SPACING_RATIO = 1.1
 
 # ---------------------------------------------------------------------------
 # Config / Tesseract detection
@@ -664,6 +676,55 @@ def _extract_text_blocks(ocr_img, scale=1.0):
     return result
 
 
+_NUMERIC_RE = re.compile(
+    r'[\$€¥£]?\s?\d[\d,\.]*\s?(?:' +
+    '|'.join(re.escape(u) for u in NUMERIC_UNITS) +
+    r')?\b'
+    r'|\b(?:19|20)\d{2}\b'
+    r'|\d+(?:\.\d+)?%',
+    re.IGNORECASE,
+)
+
+
+def _protect_numerics(text):
+    placeholders = {}
+    counter = [0]
+    def _replace(m):
+        key = f"〔NUM_{counter[0]:02d}〕"
+        placeholders[key] = m.group(0)
+        counter[0] += 1
+        return key
+    protected = _NUMERIC_RE.sub(_replace, text)
+    return protected, placeholders
+
+
+def _restore_numerics(text, placeholders):
+    for key, val in placeholders.items():
+        text = text.replace(key, val)
+    return text
+
+
+def _is_chart_block(block, img):
+    if not ENABLE_CHART_DETECTION:
+        return False
+    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+    iw, ih = img.size
+    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
+    arr = np.array(crop)
+    if arr.size == 0:
+        return False
+    unique_colors = len(np.unique(arr.reshape(-1, 3), axis=0))
+    color_ratio = unique_colors / max(1, arr.shape[0] * arr.shape[1])
+    has_many_numbers = sum(1 for w in block["text"].split() if re.match(r'[\$€¥£]?\d', w))
+    total_words = max(1, len(block["text"].split()))
+    number_ratio = has_many_numbers / total_words
+    if number_ratio > 0.5:
+        return True
+    if color_ratio < 0.05 and block["median_char_h"] < 18:
+        return True
+    return False
+
+
 def _wrap_text(text, font, max_w, draw):
     lines = []
     for paragraph in text.split("\n"):
@@ -684,54 +745,80 @@ def _wrap_text(text, font, max_w, draw):
     return lines
 
 
+def _clamp_blocks(blocks):
+    sorted_blocks = sorted(blocks, key=lambda b: (b["y"], b["x"]))
+    for i, b in enumerate(sorted_blocks):
+        b_bottom = b["y"] + b["h"]
+        for j in range(i + 1, len(sorted_blocks)):
+            other = sorted_blocks[j]
+            if other["y"] < b_bottom and _blocks_overlap_x(b, other):
+                b["h"] = max(1, other["y"] - b["y"])
+                break
+    return sorted_blocks
+
+
+def _blocks_overlap_x(a, b):
+    return a["x"] < b["x"] + b["w"] and b["x"] < a["x"] + a["w"]
+
+
+def _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px):
+    total = 0
+    for line in wrapped:
+        if not line:
+            total += fs // 2
+        else:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            total += bbox[3] - bbox[1] + line_spacing_px
+    return total
+
+
 def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
-    line_spacing = int(font_size * 0.3)
 
-    for block, translated in zip(blocks, translations):
+    clamped = _clamp_blocks(blocks)
+
+    block_map = {id(b): i for i, b in enumerate(blocks)}
+    translation_order = []
+    for b in clamped:
+        orig_idx = block_map.get(id(b))
+        if orig_idx is not None:
+            translation_order.append((b, translations[orig_idx]))
+
+    for block, translated in translation_order:
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+        is_chart = block.get("is_chart", False)
         bg_color, fg_color = _region_colors(base_img, x, y, w, h)
 
+        pad = BOX_PADDING_PX
         draw.rectangle([x, y, x + w, y + h], fill=bg_color)
 
-        margin = 3
-        max_w = w - margin * 2
+        inner_w = max(1, w - pad * 2)
+        inner_h = max(1, h - pad * 2)
 
-        fs = font_size
+        fs = min(font_size, MAX_FONT_PX)
+        line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
         font = _find_system_font(fs)
-        wrapped = _wrap_text(translated, font, max_w, draw)
+        wrapped = _wrap_text(translated, font, inner_w, draw)
+        total_h = _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px)
 
-        total_h = margin * 2
-        for line in wrapped:
-            if not line:
-                total_h += fs // 2
-            else:
-                bbox = draw.textbbox((0, 0), line, font=font)
-                total_h += bbox[3] - bbox[1] + line_spacing
-
-        while total_h > h and fs > 8:
+        while total_h > inner_h and fs > MIN_FONT_PX:
             fs -= 1
+            line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
             font = _find_system_font(fs)
-            wrapped = _wrap_text(translated, font, max_w, draw)
-            total_h = margin * 2
-            for line in wrapped:
-                if not line:
-                    total_h += fs // 2
-                else:
-                    bbox = draw.textbbox((0, 0), line, font=font)
-                    total_h += bbox[3] - bbox[1] + line_spacing
+            wrapped = _wrap_text(translated, font, inner_w, draw)
+            total_h = _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px)
 
-        dy = y + margin
+        dy = y + pad
         for line in wrapped:
             if not line:
                 dy += fs // 2
                 continue
             bbox = draw.textbbox((0, 0), line, font=font)
-            line_h = bbox[3] - bbox[1] + line_spacing
+            line_h = bbox[3] - bbox[1] + line_spacing_px
             if dy + line_h > y + h:
                 break
-            draw.text((x + margin, dy), line, fill=fg_color, font=font)
+            draw.text((x + pad, dy), line, fill=fg_color, font=font)
             dy += line_h
 
     return img
@@ -857,11 +944,24 @@ class ScreenTranslator(tk.Tk):
                     and current_first == self._prev_first_word):
                 return
 
+            for b in blocks:
+                b["is_chart"] = _is_chart_block(b, img)
+
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
             )
 
-            block_texts = [b["text"] for b in blocks]
+            block_texts = []
+            placeholder_maps = []
+            for b in blocks:
+                text = b["text"]
+                if PROTECT_NUMERIC:
+                    text, pmap = _protect_numerics(text)
+                else:
+                    pmap = {}
+                block_texts.append(text)
+                placeholder_maps.append(pmap)
+
             if len(block_texts) == 1:
                 t, _ = self._engine.translate(block_texts[0], target_code)
                 translations = [t]
@@ -874,6 +974,12 @@ class ScreenTranslator(tk.Tk):
                         for bt in block_texts
                     ]
                     translations = [f.result()[0] for f in futures]
+
+            if PROTECT_NUMERIC:
+                translations = [
+                    _restore_numerics(t, pm)
+                    for t, pm in zip(translations, placeholder_maps)
+                ]
 
             self._prev_first_word = current_first
 
