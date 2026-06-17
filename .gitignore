@@ -11,4 +11,5 @@ installer_output/
 tesseract/
 tesseract-ocr.zip
 test_output.png
+test_input.png
 test_translate.py
