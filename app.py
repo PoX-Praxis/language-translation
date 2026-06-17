@@ -885,6 +885,8 @@ class ScreenTranslator(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self.bind_all("<Control-x>", self._hotkey_translate)
+
         self.after(100, self._reposition_toolbar)
 
     def _reposition_toolbar(self):
@@ -920,6 +922,13 @@ class ScreenTranslator(tk.Tk):
     def _manual_translate(self):
         if not self.running:
             return
+        self.overlay.hide()
+        self._prev_first_word = None
+        threading.Thread(
+            target=self._scan_and_translate, daemon=True,
+        ).start()
+
+    def _hotkey_translate(self, event=None):
         self.overlay.hide()
         self._prev_first_word = None
         threading.Thread(
