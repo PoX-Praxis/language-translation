@@ -1146,7 +1146,73 @@ class ScreenTranslator(tk.Tk):
         self.destroy()
 
 
+def _run_diagnostics():
+    lines = []
+    lines.append(f"Screen Translator v{APP_VERSION}")
+    lines.append(f"Python: {sys.version.split()[0]}")
+    lines.append("")
+
+    # Tesseract
+    tess_ok = _setup_tesseract()
+    if tess_ok:
+        try:
+            ver = pytesseract.get_tesseract_version()
+            lines.append(f"[OK] Tesseract OCR: {ver}")
+        except Exception:
+            lines.append("[OK] Tesseract OCR: found")
+    else:
+        lines.append("[NG] Tesseract OCR: NOT FOUND")
+
+    # Japanese data
+    tess_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract")
+    tess_dir = os.path.dirname(tess_cmd)
+    jpn_path = os.path.join(tess_dir, "tessdata", "jpn.traineddata")
+    if os.path.exists(jpn_path):
+        lines.append("[OK] Japanese OCR data: found")
+    else:
+        lines.append("[NG] Japanese OCR data: NOT FOUND")
+
+    # Core packages
+    lines.append(f"[OK] Pillow: {Image.__version__}")
+    lines.append(f"[OK] numpy: {np.__version__}")
+
+    # Font
+    test_font = _find_system_font(16)
+    font_name = getattr(test_font, "path", str(test_font)) if hasattr(test_font, "path") else "default"
+    lines.append(f"[OK] Font: {os.path.basename(font_name)}")
+
+    # VLM
+    try:
+        from local_ocr import is_available
+        if is_available():
+            import torch
+            gpu = "GPU" if torch.cuda.is_available() else "CPU"
+            lines.append(f"[OK] VLM re-OCR: enabled ({gpu})")
+        else:
+            lines.append("[--] VLM re-OCR: disabled (torch not installed)")
+    except ImportError:
+        lines.append("[--] VLM re-OCR: disabled (local_ocr.py not found)")
+
+    # DeepL
+    api_key = _load_api_key()
+    if api_key:
+        key_type = "Free" if api_key.endswith(":fx") else "Pro"
+        lines.append(f"[OK] DeepL API Key: set ({key_type})")
+    else:
+        lines.append("[--] DeepL API Key: not set (will ask on launch)")
+
+    return "\n".join(lines)
+
+
 def main():
+    if "--diag" in sys.argv:
+        root = tk.Tk()
+        root.withdraw()
+        info = _run_diagnostics()
+        messagebox.showinfo(f"{APP_NAME} - Diagnostics", info)
+        root.destroy()
+        return
+
     if not _setup_tesseract():
         root = tk.Tk()
         root.withdraw()
