@@ -29,7 +29,7 @@ Name: "{commondesktop}\Screen Translator"; Filename: "{app}\ScreenTranslator.exe
 Name: "{group}\Uninstall Screen Translator"; Filename: "{uninstallexe}"
 
 [Tasks]
-Name: "desktopicon"; Description: "デスクトップにショートカットを作成"; GroupDescription: "追加オプション:"; Flags: checked
+Name: "desktopicon"; Description: "デスクトップにショートカットを作成"; GroupDescription: "追加オプション:"
 
 [Run]
 Filename: "{app}\ScreenTranslator.exe"; Description: "Screen Translator を起動"; Flags: nowait postinstall skipifsilent
