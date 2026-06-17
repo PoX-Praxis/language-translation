@@ -369,6 +369,18 @@ _SENTENCE_ENDINGS = set("。.!?！？;；:：」』)）】》…")
 
 _BULLET_RE = re.compile(r'^[•‣⁃◦▪○–—・･·•·\-\*]\s')
 
+_DOT_LEADER_RE = re.compile(r'[.\s]*\.{4,}[.\s]*')
+_OCR_NOISE_RE = re.compile(r'(?:\b[ceo]{1,3}\b[\s,]*){5,}')
+_TRAILING_NOISE_RE = re.compile(r'\s+[ceo.\s]{10,}\s*\d*\s*$')
+
+
+def _clean_dot_leaders(text):
+    text = _DOT_LEADER_RE.sub(' ... ', text)
+    text = _OCR_NOISE_RE.sub(' ... ', text)
+    text = _TRAILING_NOISE_RE.sub('', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
 
 def _is_bullet_line(text):
     if _BULLET_RE.match(text):
@@ -453,13 +465,19 @@ class CaptureFrame(tk.Toplevel):
             w - grip_size, h - grip_size, w, h,
             fill="#666666", outline="#666666", tags="border",
         )
+        self.canvas.create_rectangle(
+            0, 0, grip_size, grip_size,
+            fill="#666666", outline="#666666", tags="border",
+        )
 
     def _hit_zone(self, x, y):
         w = self.winfo_width()
         h = self.winfo_height()
         grip = BORDER_WIDTH + 4
         if x >= w - grip and y >= h - grip:
-            return "resize"
+            return "resize_br"
+        if x <= grip and y <= grip:
+            return "resize_tl"
         return "drag"
 
     def _on_press(self, event):
@@ -468,11 +486,13 @@ class CaptureFrame(tk.Toplevel):
         if zone == "drag":
             self._drag_data["x"] = event.x_root - self.winfo_x()
             self._drag_data["y"] = event.y_root - self.winfo_y()
-        elif zone == "resize":
+        elif zone in ("resize_br", "resize_tl"):
             self._resize_data["x"] = event.x_root
             self._resize_data["y"] = event.y_root
             self._resize_data["w"] = self.winfo_width()
             self._resize_data["h"] = self.winfo_height()
+            self._resize_data["win_x"] = self.winfo_x()
+            self._resize_data["win_y"] = self.winfo_y()
 
     def _on_motion(self, event):
         if self._zone == "drag":
@@ -481,12 +501,22 @@ class CaptureFrame(tk.Toplevel):
             self.geometry(f"+{x}+{y}")
             if self._on_move:
                 self._on_move()
-        elif self._zone == "resize":
+        elif self._zone == "resize_br":
             dx = event.x_root - self._resize_data["x"]
             dy = event.y_root - self._resize_data["y"]
             new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
             new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
             self.geometry(f"{new_w}x{new_h}")
+            if self._on_move:
+                self._on_move()
+        elif self._zone == "resize_tl":
+            dx = event.x_root - self._resize_data["x"]
+            dy = event.y_root - self._resize_data["y"]
+            new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] - dx)
+            new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] - dy)
+            new_x = self._resize_data["win_x"] + (self._resize_data["w"] - new_w)
+            new_y = self._resize_data["win_y"] + (self._resize_data["h"] - new_h)
+            self.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
             if self._on_move:
                 self._on_move()
 
@@ -686,6 +716,7 @@ def _extract_text_blocks(ocr_img, scale=1.0):
             for _, words in sorted(b["lines"].items())
         ]
         full_text = _join_hard_wraps("\n".join(line_texts))
+        full_text = _clean_dot_leaders(full_text)
         if not full_text.strip():
             continue
         avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
