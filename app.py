@@ -811,7 +811,11 @@ def _render_inplace(base_img, blocks, translations, font_size):
         inner_w = max(1, w - pad * 2)
         inner_h = max(1, h - pad * 2)
 
-        fs = min(font_size, MAX_FONT_PX)
+        orig_char_h = block.get("median_char_h", 0)
+        if orig_char_h >= MIN_FONT_PX:
+            fs = min(orig_char_h, MAX_FONT_PX)
+        else:
+            fs = min(font_size, MAX_FONT_PX)
         line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
         font = _find_system_font(fs)
         wrapped = _wrap_text(translated, font, inner_w, draw)
