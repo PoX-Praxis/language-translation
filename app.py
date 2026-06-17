@@ -369,6 +369,18 @@ _SENTENCE_ENDINGS = set("。.!?！？;；:：」』)）】》…")
 
 _BULLET_RE = re.compile(r'^[•‣⁃◦▪○–—・･·•·\-\*]\s')
 
+_DOT_LEADER_RE = re.compile(r'[.\s]*\.{4,}[.\s]*')
+_OCR_NOISE_RE = re.compile(r'(?:\b[ceo]{1,3}\b[\s,]*){5,}')
+_TRAILING_NOISE_RE = re.compile(r'\s+[ceo.\s]{10,}\s*\d*\s*$')
+
+
+def _clean_dot_leaders(text):
+    text = _DOT_LEADER_RE.sub(' ... ', text)
+    text = _OCR_NOISE_RE.sub(' ... ', text)
+    text = _TRAILING_NOISE_RE.sub('', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
 
 def _is_bullet_line(text):
     if _BULLET_RE.match(text):
@@ -686,6 +698,7 @@ def _extract_text_blocks(ocr_img, scale=1.0):
             for _, words in sorted(b["lines"].items())
         ]
         full_text = _join_hard_wraps("\n".join(line_texts))
+        full_text = _clean_dot_leaders(full_text)
         if not full_text.strip():
             continue
         avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
