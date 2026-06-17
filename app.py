@@ -382,6 +382,49 @@ def _clean_dot_leaders(text):
     return text
 
 
+# Table-of-contents line: <heading> <dot-leader or wide gap> <page number>
+_TOC_PAGE_RE = re.compile(
+    r'^(.*?\S)'                          # 1: heading (ends in non-space)
+    r'(?:'
+        r'\s*(?:[.·•‥…]\s*){2,}'      # space-separated dot leader (2+ dots)
+        r'|\s{2,}'                        # OR a wide gap
+    r')'
+    r'[.·•‥…\s]*'                  # trailing leader remnants
+    r'(\d{1,4})\s*$'                     # 2: page number
+)
+# OCR garbage remnants left on a heading tail (e.g. "Structure. cece eee")
+_TOC_TAIL_NOISE_RE = re.compile(r'[\s.]*(?:\b[ceo]{1,3}\b[\s.]*){2,}$', re.IGNORECASE)
+
+
+def _parse_toc_lines(lines):
+    """Detect a table-of-contents block from raw OCR lines.
+
+    Returns a list of (heading, page_number_or_None) tuples if the lines look
+    like a TOC, otherwise None. Page numbers and dot leaders are stripped from
+    the heading so only the heading is sent for translation.
+    """
+    clean = [l.strip() for l in lines if l.strip()]
+    if len(clean) < 3:
+        return None
+    entries = []
+    matched = 0
+    for ln in clean:
+        m = _TOC_PAGE_RE.match(ln)
+        if m:
+            heading = m.group(1).strip()
+            heading = _TOC_TAIL_NOISE_RE.sub('', heading).strip()
+            heading = heading.rstrip('.').strip()
+            if heading:
+                entries.append((heading, m.group(2)))
+                matched += 1
+                continue
+        entries.append((ln, None))
+    if matched >= 3 and matched >= 0.6 * len(clean):
+        return entries
+    return None
+
+
+
 def _is_bullet_line(text):
     if _BULLET_RE.match(text):
         return True
@@ -715,8 +758,12 @@ def _extract_text_blocks(ocr_img, scale=1.0):
             " ".join(words)
             for _, words in sorted(b["lines"].items())
         ]
-        full_text = _join_hard_wraps("\n".join(line_texts))
-        full_text = _clean_dot_leaders(full_text)
+        toc_entries = _parse_toc_lines(line_texts)
+        if toc_entries:
+            full_text = "\n".join(h for h, _ in toc_entries)
+        else:
+            full_text = _join_hard_wraps("\n".join(line_texts))
+            full_text = _clean_dot_leaders(full_text)
         if not full_text.strip():
             continue
         avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
@@ -741,6 +788,8 @@ def _extract_text_blocks(ocr_img, scale=1.0):
             "text": full_text,
             "median_char_h": int(avg_h * inv_scale),
             "median_conf": median_conf,
+            "is_toc": bool(toc_entries),
+            "toc_pages": [p for _, p in toc_entries] if toc_entries else None,
         })
     return result
 
@@ -861,6 +910,8 @@ def _expand_blocks(blocks, translations, img_h, scale_pct):
         orig_idx = block_map.get(id(b))
         if orig_idx is None:
             continue
+        if b.get("is_toc"):
+            continue
         translated = translations[orig_idx]
         pad = BOX_PADDING_PX
         inner_w = max(1, b["w"] - pad * 2)
@@ -890,6 +941,65 @@ def _expand_blocks(blocks, translations, img_h, scale_pct):
     return blocks
 
 
+def _render_toc_block(draw, block, translated, x, y, w, h, pad, fg_color, scale_pct):
+    """Render a table-of-contents block: heading (left) + dot leader + page (right).
+
+    The translated text is the headings joined by newlines, paired with the
+    original page numbers stored in block["toc_pages"]. Falls back to plain
+    wrapped rendering if the line counts don't line up.
+    """
+    headings = translated.split("\n")
+    pages = block["toc_pages"]
+    if len(headings) != len(pages):
+        # Translation didn't preserve line structure; render headings only.
+        pages = pages + [None] * (len(headings) - len(pages))
+        pages = pages[:len(headings)]
+
+    inner_w = max(1, w - pad * 2)
+    inner_h = max(1, h - pad * 2)
+    n = max(1, len(headings))
+
+    fs = _calc_font_size(block, scale_pct)
+    font = _find_system_font(fs)
+    # Shrink so all entries fit vertically.
+    while fs > MIN_FONT_PX:
+        line_h = int(fs * LINE_SPACING_RATIO)
+        if line_h * n <= inner_h:
+            break
+        fs -= 1
+        font = _find_system_font(fs)
+    line_h = max(fs + 1, int(fs * LINE_SPACING_RATIO))
+
+    dot_w = max(1, draw.textlength(". ", font=font))
+
+    dy = y + pad
+    for heading, page in zip(headings, pages):
+        if dy + line_h > y + h:
+            break
+        heading = heading.strip()
+        if page is None:
+            draw.text((x + pad, dy), heading, fill=fg_color, font=font)
+            dy += line_h
+            continue
+        page_str = str(page)
+        page_w = draw.textlength(page_str, font=font)
+        head_max = max(dot_w, inner_w - page_w - dot_w * 2)
+        # Trim heading if it would collide with the page number.
+        while heading and draw.textlength(heading, font=font) > head_max:
+            heading = heading[:-1]
+        head_w = draw.textlength(heading, font=font)
+        draw.text((x + pad, dy), heading, fill=fg_color, font=font)
+        # Page number, right-aligned.
+        draw.text((x + w - pad - page_w, dy), page_str, fill=fg_color, font=font)
+        # Dot leader filling the gap.
+        leader_start = x + pad + head_w + dot_w
+        leader_end = x + w - pad - page_w - dot_w
+        n_dots = int((leader_end - leader_start) / dot_w)
+        if n_dots > 0:
+            draw.text((leader_start, dy), ". " * n_dots, fill=fg_color, font=font)
+        dy += line_h
+
+
 def _render_inplace(base_img, blocks, translations, scale_pct):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
@@ -913,6 +1023,13 @@ def _render_inplace(base_img, blocks, translations, scale_pct):
 
         pad = BOX_PADDING_PX
         draw.rectangle([x, y, x + w, y + h], fill=bg_color)
+
+        if block.get("is_toc") and block.get("toc_pages"):
+            _render_toc_block(
+                draw, block, translated, x, y, w, h,
+                pad, fg_color, scale_pct,
+            )
+            continue
 
         inner_w = max(1, w - pad * 2)
         inner_h = max(1, h - pad * 2)
