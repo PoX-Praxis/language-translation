@@ -367,6 +367,17 @@ def _first_word(text):
 _SENTENCE_ENDINGS = set("。.!?！？;；:：」』)）】》…")
 
 
+_BULLET_RE = re.compile(r'^[•‣⁃◦▪○–—・･·•·\-\*]\s')
+
+
+def _is_bullet_line(text):
+    if _BULLET_RE.match(text):
+        return True
+    if re.match(r'^\d+[\.\)]\s', text):
+        return True
+    return False
+
+
 def _join_hard_wraps(text):
     raw_lines = text.split("\n")
     paragraphs = []
@@ -378,6 +389,11 @@ def _join_hard_wraps(text):
             if current:
                 paragraphs.append(" ".join(current))
                 current = []
+            continue
+        if _is_bullet_line(stripped):
+            if current:
+                paragraphs.append(" ".join(current))
+            current = [stripped]
             continue
         if current:
             prev = current[-1]
