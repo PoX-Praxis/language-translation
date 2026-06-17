@@ -31,14 +31,29 @@ if not exist "tesseract\tesseract.exe" (
         echo Please install Tesseract first:
         echo   1. Go to https://github.com/UB-Mannheim/tesseract/wiki
         echo   2. Download and install the Windows 64-bit version
-        echo   3. During install, check "Japanese" in Additional language data
-        echo   4. Re-run this script
+        echo   3. Re-run this script
         echo.
         pause
         exit /b 1
     )
 ) else (
     echo Tesseract already present in tesseract\ folder.
+)
+
+REM --- Step 1b: Ensure Japanese OCR data ---
+if not exist "tesseract\tessdata\jpn.traineddata" (
+    echo.
+    echo Japanese OCR data not found. Downloading...
+    powershell -Command "Invoke-WebRequest -Uri 'https://github.com/tesseract-ocr/tessdata/raw/main/jpn.traineddata' -OutFile 'tesseract\tessdata\jpn.traineddata'"
+    if exist "tesseract\tessdata\jpn.traineddata" (
+        echo [OK] Japanese OCR data downloaded.
+    ) else (
+        echo [WARNING] Failed to download Japanese OCR data.
+        echo   Manually download from: https://github.com/tesseract-ocr/tessdata/raw/main/jpn.traineddata
+        echo   Place in: tesseract\tessdata\jpn.traineddata
+    )
+) else (
+    echo [OK] Japanese OCR data found.
 )
 
 echo.
