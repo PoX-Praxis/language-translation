@@ -465,13 +465,19 @@ class CaptureFrame(tk.Toplevel):
             w - grip_size, h - grip_size, w, h,
             fill="#666666", outline="#666666", tags="border",
         )
+        self.canvas.create_rectangle(
+            0, 0, grip_size, grip_size,
+            fill="#666666", outline="#666666", tags="border",
+        )
 
     def _hit_zone(self, x, y):
         w = self.winfo_width()
         h = self.winfo_height()
         grip = BORDER_WIDTH + 4
         if x >= w - grip and y >= h - grip:
-            return "resize"
+            return "resize_br"
+        if x <= grip and y <= grip:
+            return "resize_tl"
         return "drag"
 
     def _on_press(self, event):
@@ -480,11 +486,13 @@ class CaptureFrame(tk.Toplevel):
         if zone == "drag":
             self._drag_data["x"] = event.x_root - self.winfo_x()
             self._drag_data["y"] = event.y_root - self.winfo_y()
-        elif zone == "resize":
+        elif zone in ("resize_br", "resize_tl"):
             self._resize_data["x"] = event.x_root
             self._resize_data["y"] = event.y_root
             self._resize_data["w"] = self.winfo_width()
             self._resize_data["h"] = self.winfo_height()
+            self._resize_data["win_x"] = self.winfo_x()
+            self._resize_data["win_y"] = self.winfo_y()
 
     def _on_motion(self, event):
         if self._zone == "drag":
@@ -493,12 +501,22 @@ class CaptureFrame(tk.Toplevel):
             self.geometry(f"+{x}+{y}")
             if self._on_move:
                 self._on_move()
-        elif self._zone == "resize":
+        elif self._zone == "resize_br":
             dx = event.x_root - self._resize_data["x"]
             dy = event.y_root - self._resize_data["y"]
             new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] + dx)
             new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] + dy)
             self.geometry(f"{new_w}x{new_h}")
+            if self._on_move:
+                self._on_move()
+        elif self._zone == "resize_tl":
+            dx = event.x_root - self._resize_data["x"]
+            dy = event.y_root - self._resize_data["y"]
+            new_w = max(MIN_FRAME_SIZE, self._resize_data["w"] - dx)
+            new_h = max(MIN_FRAME_SIZE, self._resize_data["h"] - dy)
+            new_x = self._resize_data["win_x"] + (self._resize_data["w"] - new_w)
+            new_y = self._resize_data["win_y"] + (self._resize_data["h"] - new_h)
+            self.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
             if self._on_move:
                 self._on_move()
 
