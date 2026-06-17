@@ -673,6 +673,12 @@ def _extract_text_blocks(ocr_img, scale=1.0):
             continue
         avg_h = int(np.median(b["word_heights"])) if b["word_heights"] else 16
         median_conf = int(np.median(b["confs"])) if b["confs"] else 0
+        word_count = len(b["words"])
+        text_len = len(full_text.strip())
+        if word_count <= 2 and median_conf < CONF_THRESHOLD:
+            continue
+        if text_len < 3:
+            continue
         pad_x = 6
         pad_y = 4
         raw_x = b["x"]
