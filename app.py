@@ -193,10 +193,14 @@ class DeepLEngine:
 
     def __init__(self, api_key=""):
         self.api_key = api_key
+        self._cache = {}
 
     def translate(self, text, target_code):
         if not self.api_key:
             raise RuntimeError("DeepL API key is not set")
+        cache_key = (text, target_code)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         deepl_code = DEEPL_LANG_MAP.get(target_code, target_code.upper())
         is_free = self.api_key.endswith(":fx")
         url = self._FREE_URL if is_free else self._PRO_URL
@@ -211,7 +215,9 @@ class DeepLEngine:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         tr = body["translations"][0]
-        return tr["text"], tr.get("detected_source_language", "auto").lower()
+        result = (tr["text"], tr.get("detected_source_language", "auto").lower())
+        self._cache[cache_key] = result
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -793,9 +799,53 @@ def _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px):
     return total
 
 
+def _expand_blocks(blocks, translations, img_h, font_size):
+    sorted_blocks = sorted(blocks, key=lambda b: (b["y"], b["x"]))
+    block_map = {id(b): i for i, b in enumerate(blocks)}
+
+    dummy_img = Image.new("RGB", (1, 1))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+
+    for i, b in enumerate(sorted_blocks):
+        orig_idx = block_map.get(id(b))
+        if orig_idx is None:
+            continue
+        translated = translations[orig_idx]
+        pad = BOX_PADDING_PX
+        inner_w = max(1, b["w"] - pad * 2)
+
+        orig_char_h = b.get("median_char_h", 0)
+        if orig_char_h >= MIN_FONT_PX:
+            fs = min(orig_char_h, MAX_FONT_PX)
+        else:
+            fs = min(font_size, MAX_FONT_PX)
+        line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
+        font = _find_system_font(fs)
+        wrapped = _wrap_text(translated, font, inner_w, dummy_draw)
+        needed_h = _calc_wrapped_height(wrapped, font, fs, dummy_draw, line_spacing_px)
+        needed_h += pad * 2
+
+        if needed_h <= b["h"]:
+            continue
+
+        max_bottom = img_h
+        for j in range(i + 1, len(sorted_blocks)):
+            other = sorted_blocks[j]
+            if _blocks_overlap_x(b, other):
+                max_bottom = other["y"]
+                break
+
+        b["h"] = min(needed_h, max_bottom - b["y"])
+
+    return blocks
+
+
 def _render_inplace(base_img, blocks, translations, font_size):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
+
+    img_h = base_img.size[1]
+    _expand_blocks(blocks, translations, img_h, font_size)
 
     clamped = _clamp_blocks(blocks)
 
