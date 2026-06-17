@@ -25,7 +25,7 @@ import mss
 import pytesseract
 
 APP_NAME = "Screen Translator"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # OCR settings (all tunable constants)
