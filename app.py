@@ -44,8 +44,6 @@ TESS_LANG = "jpn+eng"
 CONF_THRESHOLD = 60
 SMALL_CHAR_PX = 14
 MAX_LLM_BLOCKS = 3
-LOCAL_OCR_MODEL = "got-ocr2"
-
 # --- Phase 4: Chart detection & rendering ---
 ENABLE_CHART_DETECTION = True
 PROTECT_NUMERIC = True
@@ -108,8 +106,6 @@ LANG_OPTIONS = {
     "Tiếng Việt": "vi",
     "ไทย": "th",
 }
-
-LANG_NAMES_NATIVE = {v: k for k, v in LANG_OPTIONS.items()}
 
 BORDER_WIDTH = 14
 MIN_FRAME_SIZE = BORDER_WIDTH * 4
@@ -194,13 +190,15 @@ class DeepLEngine:
     def __init__(self, api_key=""):
         self.api_key = api_key
         self._cache = {}
+        self._cache_lock = threading.Lock()
 
     def translate(self, text, target_code):
         if not self.api_key:
             raise RuntimeError("DeepL API key is not set")
         cache_key = (text, target_code)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        with self._cache_lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
         deepl_code = DEEPL_LANG_MAP.get(target_code, target_code.upper())
         is_free = self.api_key.endswith(":fx")
         url = self._FREE_URL if is_free else self._PRO_URL
@@ -216,7 +214,8 @@ class DeepLEngine:
             body = json.loads(resp.read().decode("utf-8"))
         tr = body["translations"][0]
         result = (tr["text"], tr.get("detected_source_language", "auto").lower())
-        self._cache[cache_key] = result
+        with self._cache_lock:
+            self._cache[cache_key] = result
         return result
 
 
@@ -300,12 +299,6 @@ def _preprocess_for_ocr(pil_img):
     binary = ((arr > thresh) * 255).astype(np.uint8)
 
     return Image.fromarray(binary)
-
-
-def _dominant_color(img):
-    arr = np.array(img.resize((50, 50)))
-    avg = arr.mean(axis=(0, 1)).astype(int)
-    return tuple(avg[:3])
 
 
 def _region_colors(img, x, y, w, h):
@@ -558,14 +551,16 @@ class Toolbar(tk.Toplevel):
         )
         lang_combo.pack(side=tk.LEFT, padx=1)
 
-        self.fontsize_var = tk.StringVar(value="16")
+        self.fontsize_var = tk.StringVar(value="100")
         self.fontsize_var.trace_add("write", self._on_fontsize_change)
         fontsize_spin = tk.Spinbox(
-            f, from_=8, to=48, textvariable=self.fontsize_var,
-            width=3, font=("", 8), bg="#555555", fg="white",
+            f, from_=50, to=200, increment=10, textvariable=self.fontsize_var,
+            width=4, font=("", 8), bg="#555555", fg="white",
             buttonbackground="#666666",
         )
         fontsize_spin.pack(side=tk.LEFT, padx=1)
+        tk.Label(f, text="%", font=("", 7), bg="#444444", fg="#AAAAAA").pack(
+            side=tk.LEFT)
 
         self._on_fontsize = None
 
@@ -799,7 +794,16 @@ def _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px):
     return total
 
 
-def _expand_blocks(blocks, translations, img_h, font_size):
+def _calc_font_size(block, scale_pct):
+    orig_char_h = block.get("median_char_h", 0)
+    if orig_char_h >= MIN_FONT_PX:
+        fs = int(orig_char_h * scale_pct / 100)
+    else:
+        fs = int(16 * scale_pct / 100)
+    return max(MIN_FONT_PX, min(fs, MAX_FONT_PX))
+
+
+def _expand_blocks(blocks, translations, img_h, scale_pct):
     sorted_blocks = sorted(blocks, key=lambda b: (b["y"], b["x"]))
     block_map = {id(b): i for i, b in enumerate(blocks)}
 
@@ -814,11 +818,10 @@ def _expand_blocks(blocks, translations, img_h, font_size):
         pad = BOX_PADDING_PX
         inner_w = max(1, b["w"] - pad * 2)
 
-        orig_char_h = b.get("median_char_h", 0)
-        if orig_char_h >= MIN_FONT_PX:
-            fs = min(orig_char_h, MAX_FONT_PX)
-        else:
-            fs = min(font_size, MAX_FONT_PX)
+        b.setdefault("_orig_h", b["h"])
+        b["h"] = b["_orig_h"]
+
+        fs = _calc_font_size(b, scale_pct)
         line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
         font = _find_system_font(fs)
         wrapped = _wrap_text(translated, font, inner_w, dummy_draw)
@@ -840,12 +843,12 @@ def _expand_blocks(blocks, translations, img_h, font_size):
     return blocks
 
 
-def _render_inplace(base_img, blocks, translations, font_size):
+def _render_inplace(base_img, blocks, translations, scale_pct):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
 
     img_h = base_img.size[1]
-    _expand_blocks(blocks, translations, img_h, font_size)
+    _expand_blocks(blocks, translations, img_h, scale_pct)
 
     clamped = _clamp_blocks(blocks)
 
@@ -867,11 +870,7 @@ def _render_inplace(base_img, blocks, translations, font_size):
         inner_w = max(1, w - pad * 2)
         inner_h = max(1, h - pad * 2)
 
-        orig_char_h = block.get("median_char_h", 0)
-        if orig_char_h >= MIN_FONT_PX:
-            fs = min(orig_char_h, MAX_FONT_PX)
-        else:
-            fs = min(font_size, MAX_FONT_PX)
+        fs = _calc_font_size(block, scale_pct)
         line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
         font = _find_system_font(fs)
         wrapped = _wrap_text(translated, font, inner_w, draw)
@@ -967,7 +966,7 @@ class ScreenTranslator(tk.Tk):
             threading.Thread(
                 target=self._scan_and_translate, daemon=True,
             ).start()
-        self.after(1000, self._poll)
+        self.after(2000, self._poll)
 
     def _manual_translate(self):
         if not self.running:
@@ -991,9 +990,9 @@ class ScreenTranslator(tk.Tk):
     def _on_fontsize_change(self):
         if self._last_render and self.overlay.is_visible:
             lr = self._last_render
-            font_size = int(self.toolbar.fontsize_var.get())
+            scale_pct = int(self.toolbar.fontsize_var.get())
             result_img = _render_inplace(
-                lr["img"], lr["blocks"], lr["translations"], font_size,
+                lr["img"], lr["blocks"], lr["translations"], scale_pct,
             )
             self.overlay.show_at(
                 lr["x"], lr["y"], lr["w"], lr["h"], result_img,
@@ -1067,10 +1066,10 @@ class ScreenTranslator(tk.Tk):
 
             self._prev_first_word = current_first
 
-            font_size = int(self.toolbar.fontsize_var.get())
+            scale_pct = int(self.toolbar.fontsize_var.get())
             w, h = region["width"], region["height"]
             rx, ry = region["left"], region["top"]
-            result_img = _render_inplace(img, blocks, translations, font_size)
+            result_img = _render_inplace(img, blocks, translations, scale_pct)
 
             self._last_render = {
                 "img": img, "blocks": blocks,
