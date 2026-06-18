@@ -377,6 +377,13 @@ _REPEATED_CHAR_RE = re.compile(r'(.)\1{3,}')
 _OCR_NOISE_CHARS = set('econsatl')
 
 
+_DIGIT_DOT_JUNK_RE = re.compile(r'^[\d.]+$')
+
+
+def _strip_trailing_dots(word):
+    return word.rstrip('.').rstrip('·').rstrip('•')
+
+
 def _is_ocr_noise_word(text, conf):
     s = text.strip()
     if not s:
@@ -389,11 +396,27 @@ def _is_ocr_noise_word(text, conf):
         return True
     if len(set(s)) <= 2 and len(s) >= 4:
         return True
+    if _DIGIT_DOT_JUNK_RE.match(s) and conf < 50:
+        return True
     if conf < 50 and len(s) >= 2:
         noise_count = sum(1 for c in s.lower() if c in _OCR_NOISE_CHARS or c.isdigit())
-        if noise_count >= len(s) * 0.7:
+        threshold = 0.85 if len(s) >= 6 else 0.7
+        if noise_count >= len(s) * threshold:
             return True
     return False
+
+
+def _clean_ocr_word(text, conf):
+    """Clean an OCR word: strip trailing dots, return cleaned text or empty if noise."""
+    s = text.strip()
+    if not s:
+        return ""
+    cleaned = _strip_trailing_dots(s)
+    if not cleaned:
+        return ""
+    if _is_ocr_noise_word(cleaned, conf):
+        return ""
+    return cleaned
 
 
 def _clean_dot_leaders(text):
@@ -755,11 +778,13 @@ def _extract_text_blocks(ocr_img, scale=1.0, dump_ocr=False):
                 if conf < 0 or not txt.strip():
                     continue
                 chars = ' '.join(f'U+{ord(c):04X}' for c in txt.strip())
-                skip = _is_ocr_noise_word(txt.strip(), conf)
+                cleaned = _clean_ocr_word(txt.strip(), conf)
+                skip = not cleaned
                 f.write(
                     f"blk={blk} ln={ln} conf={conf:3d} "
                     f"skip={skip} "
                     f"text={repr(txt.strip()):30s} "
+                    f"clean={repr(cleaned):30s} "
                     f"unicode=[{chars}]\n"
                 )
             f.write("\n=== END ===\n")
@@ -768,10 +793,11 @@ def _extract_text_blocks(ocr_img, scale=1.0, dump_ocr=False):
     n = len(data["text"])
     for i in range(n):
         conf = int(data["conf"][i])
-        text = data["text"][i].strip()
-        if conf < 0 or not text:
+        raw_text = data["text"][i].strip()
+        if conf < 0 or not raw_text:
             continue
-        if _is_ocr_noise_word(text, conf):
+        text = _clean_ocr_word(raw_text, conf)
+        if not text:
             continue
         block_id = data["block_num"][i]
         if block_id not in blocks:
