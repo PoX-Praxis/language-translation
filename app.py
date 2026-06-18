@@ -373,25 +373,51 @@ _DOT_LEADER_RE = re.compile(r'[.\s]*\.{4,}[.\s]*')
 _OCR_NOISE_RE = re.compile(r'(?:\b[ceo]{1,3}\b[\s,]*){5,}')
 _TRAILING_NOISE_RE = re.compile(r'\s+[ceo.\s]{10,}\s*\d*\s*$')
 _DOT_CHARS = set('.·•‥…・･。｡●○◯◦⋅∙⠂⠄')
+_REPEATED_CHAR_RE = re.compile(r'(.)\1{3,}')
 
 
-def _is_dot_leader_line(line):
+def _is_repetitive_word(word):
+    """True if the word is a single character repeated (e.g. ・・・・, cccc, eeee)."""
+    s = word.strip()
+    if len(s) < 3:
+        return False
+    if all(c in _DOT_CHARS for c in s):
+        return True
+    if len(set(s)) <= 2 and len(s) >= 4:
+        return True
+    if _REPEATED_CHAR_RE.search(s):
+        return True
+    return False
+
+
+def _is_repetitive_line(line):
+    """True if the line is mostly repetitive or dot-leader characters."""
     stripped = line.strip()
     if not stripped:
         return False
+    if len(stripped) >= 4 and len(set(stripped.replace(' ', ''))) <= 2:
+        return True
     dot_count = sum(1 for c in stripped if c in _DOT_CHARS or c.isspace())
-    return dot_count >= len(stripped) * 0.7
+    if dot_count >= len(stripped) * 0.7:
+        return True
+    words = stripped.split()
+    if words and all(_is_repetitive_word(w) for w in words):
+        return True
+    return False
 
 
 def _clean_dot_leaders(text):
     lines = text.split('\n')
     cleaned = []
     for line in lines:
-        if _is_dot_leader_line(line):
+        if _is_repetitive_line(line):
             continue
         line = _DOT_LEADER_RE.sub(' ', line)
         line = _OCR_NOISE_RE.sub(' ', line)
         line = _TRAILING_NOISE_RE.sub('', line)
+        words = line.split()
+        words = [w for w in words if not _is_repetitive_word(w)]
+        line = ' '.join(words)
         cleaned.append(line)
     text = '\n'.join(cleaned)
     text = re.sub(r'\s{2,}', ' ', text).strip()
@@ -740,7 +766,7 @@ def _extract_text_blocks(ocr_img, scale=1.0):
         text = data["text"][i].strip()
         if conf < 0 or not text:
             continue
-        if all(c in _DOT_CHARS for c in text):
+        if _is_repetitive_word(text):
             continue
         block_id = data["block_num"][i]
         if block_id not in blocks:
