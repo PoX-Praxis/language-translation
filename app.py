@@ -676,6 +676,7 @@ class Toolbar(tk.Toplevel):
         lang_combo.pack(side=tk.LEFT, padx=1)
 
         self.fontsize_var = tk.StringVar(value="100")
+        self._on_fontsize = None
         self.fontsize_var.trace_add("write", self._on_fontsize_change)
         fontsize_spin = tk.Spinbox(
             f, from_=50, to=200, increment=10, textvariable=self.fontsize_var,
@@ -685,8 +686,6 @@ class Toolbar(tk.Toplevel):
         fontsize_spin.pack(side=tk.LEFT, padx=1)
         tk.Label(f, text="%", font=("", 7), bg="#444444", fg="#AAAAAA").pack(
             side=tk.LEFT)
-
-        self._on_fontsize = None
 
         self.toggle_btn = tk.Button(
             f, text="Start", command=self._do_toggle,
