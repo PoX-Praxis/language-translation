@@ -372,12 +372,28 @@ _BULLET_RE = re.compile(r'^[•‣⁃◦▪○–—・･·•·\-\*]\s')
 _DOT_LEADER_RE = re.compile(r'[.\s]*\.{4,}[.\s]*')
 _OCR_NOISE_RE = re.compile(r'(?:\b[ceo]{1,3}\b[\s,]*){5,}')
 _TRAILING_NOISE_RE = re.compile(r'\s+[ceo.\s]{10,}\s*\d*\s*$')
+_DOT_CHARS = set('.·•‥…・･。｡●○◯◦⋅∙⠂⠄')
+
+
+def _is_dot_leader_line(line):
+    stripped = line.strip()
+    if not stripped:
+        return False
+    dot_count = sum(1 for c in stripped if c in _DOT_CHARS or c.isspace())
+    return dot_count >= len(stripped) * 0.7
 
 
 def _clean_dot_leaders(text):
-    text = _DOT_LEADER_RE.sub(' ... ', text)
-    text = _OCR_NOISE_RE.sub(' ... ', text)
-    text = _TRAILING_NOISE_RE.sub('', text)
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        if _is_dot_leader_line(line):
+            continue
+        line = _DOT_LEADER_RE.sub(' ', line)
+        line = _OCR_NOISE_RE.sub(' ', line)
+        line = _TRAILING_NOISE_RE.sub('', line)
+        cleaned.append(line)
+    text = '\n'.join(cleaned)
     text = re.sub(r'\s{2,}', ' ', text).strip()
     return text
 
@@ -723,6 +739,8 @@ def _extract_text_blocks(ocr_img, scale=1.0):
         conf = int(data["conf"][i])
         text = data["text"][i].strip()
         if conf < 0 or not text:
+            continue
+        if all(c in _DOT_CHARS for c in text):
             continue
         block_id = data["block_num"][i]
         if block_id not in blocks:
