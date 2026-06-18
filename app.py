@@ -427,26 +427,18 @@ def _clean_dot_leaders(text):
     return text
 
 
-# Table-of-contents line: <heading> <dot-leader or wide gap> <page number>
-_TOC_PAGE_RE = re.compile(
-    r'^(.*?\S)'                          # 1: heading (ends in non-space)
-    r'(?:'
-        r'\s*(?:[.·•‥…]\s*){2,}'      # space-separated dot leader (2+ dots)
-        r'|\s{2,}'                        # OR a wide gap
-    r')'
-    r'[.·•‥…\s]*'                  # trailing leader remnants
-    r'(\d{1,4})\s*$'                     # 2: page number
+# TOC line after dot-leader cleanup: "<heading> <page number>" at end of line
+_TOC_LINE_RE = re.compile(
+    r'^(.+?)\s+(\d{1,4})\s*$'
 )
-# OCR garbage remnants left on a heading tail (e.g. "Structure. cece eee")
-_TOC_TAIL_NOISE_RE = re.compile(r'[\s.]*(?:\b[ceo]{1,3}\b[\s.]*){2,}$', re.IGNORECASE)
 
 
 def _parse_toc_lines(lines):
-    """Detect a table-of-contents block from raw OCR lines.
+    """Detect a table-of-contents block from cleaned OCR lines.
 
+    After noise filtering, TOC lines look like "Evolution, Not Revolution 9".
     Returns a list of (heading, page_number_or_None) tuples if the lines look
-    like a TOC, otherwise None. Page numbers and dot leaders are stripped from
-    the heading so only the heading is sent for translation.
+    like a TOC, otherwise None.
     """
     clean = [l.strip() for l in lines if l.strip()]
     if len(clean) < 3:
@@ -454,12 +446,10 @@ def _parse_toc_lines(lines):
     entries = []
     matched = 0
     for ln in clean:
-        m = _TOC_PAGE_RE.match(ln)
+        m = _TOC_LINE_RE.match(ln)
         if m:
             heading = m.group(1).strip()
-            heading = _TOC_TAIL_NOISE_RE.sub('', heading).strip()
-            heading = heading.rstrip('.').strip()
-            if heading:
+            if len(heading) >= 3:
                 entries.append((heading, m.group(2)))
                 matched += 1
                 continue
@@ -1305,18 +1295,37 @@ class ScreenTranslator(tk.Tk):
                 block_texts.append(text)
                 placeholder_maps.append(pmap)
 
-            if len(block_texts) == 1:
-                t, _ = self._engine.translate(block_texts[0], target_code)
-                translations = [t]
-            else:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=4,
-                ) as pool:
-                    futures = [
-                        pool.submit(self._engine.translate, bt, target_code)
-                        for bt in block_texts
-                    ]
-                    translations = [f.result()[0] for f in futures]
+            # Collect all individual translation tasks
+            all_tasks = []  # (block_idx, sub_idx_or_None, text)
+            for i, b in enumerate(blocks):
+                if b.get("is_toc") and b.get("toc_pages"):
+                    headings = block_texts[i].split("\n")
+                    for si, h in enumerate(headings):
+                        h = h.strip()
+                        if h:
+                            all_tasks.append((i, si, h))
+                else:
+                    all_tasks.append((i, None, block_texts[i]))
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=4,
+            ) as pool:
+                futures = [
+                    pool.submit(self._engine.translate, task[2], target_code)
+                    for task in all_tasks
+                ]
+                results = [f.result()[0] for f in futures]
+
+            translations = [""] * len(blocks)
+            toc_heading_map = {}
+            for (bi, si, _), translated in zip(all_tasks, results):
+                if si is None:
+                    translations[bi] = translated
+                else:
+                    toc_heading_map.setdefault(bi, [])
+                    toc_heading_map[bi].append(translated)
+            for bi, heads in toc_heading_map.items():
+                translations[bi] = "\n".join(heads)
 
             if PROTECT_NUMERIC:
                 translations = [
