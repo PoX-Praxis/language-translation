@@ -753,12 +753,37 @@ class Toolbar(tk.Toplevel):
         self.geometry(f"+{x}+{y}")
 
 
-def _extract_text_blocks(ocr_img, scale=1.0):
+def _extract_text_blocks(ocr_img, scale=1.0, dump_ocr=False):
     tess_config = f"--oem {TESS_OEM} --psm {TESS_PSM}"
     data = pytesseract.image_to_data(
         ocr_img, lang=TESS_LANG, config=tess_config,
         output_type=pytesseract.Output.DICT,
     )
+
+    if dump_ocr:
+        dump_path = os.path.join(
+            os.path.expanduser("~"), "Desktop", "ocr_dump.txt"
+        )
+        with open(dump_path, "w", encoding="utf-8") as f:
+            f.write("=== RAW OCR DATA ===\n")
+            n = len(data["text"])
+            for i in range(n):
+                txt = data["text"][i]
+                conf = int(data["conf"][i])
+                blk = data["block_num"][i]
+                ln = data["line_num"][i]
+                if conf < 0 or not txt.strip():
+                    continue
+                chars = ' '.join(f'U+{ord(c):04X}' for c in txt.strip())
+                skip = _is_repetitive_word(txt.strip())
+                f.write(
+                    f"blk={blk} ln={ln} conf={conf:3d} "
+                    f"skip={skip} "
+                    f"text={repr(txt.strip()):30s} "
+                    f"unicode=[{chars}]\n"
+                )
+            f.write("\n=== END ===\n")
+        print(f"[DEBUG] OCR dump saved to: {dump_path}")
     blocks = {}
     n = len(data["text"])
     for i in range(n):
@@ -1143,6 +1168,7 @@ class ScreenTranslator(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.bind_all("<Control-x>", self._hotkey_translate)
+        self.bind_all("<Control-d>", self._hotkey_dump_ocr)
 
         self.after(100, self._reposition_toolbar)
 
@@ -1191,6 +1217,26 @@ class ScreenTranslator(tk.Tk):
         threading.Thread(
             target=self._scan_and_translate, daemon=True,
         ).start()
+
+    def _hotkey_dump_ocr(self, event=None):
+        threading.Thread(target=self._dump_ocr, daemon=True).start()
+
+    def _dump_ocr(self):
+        try:
+            region = self.capture_frame.get_inner_region()
+            with mss.mss() as sct:
+                screenshot = sct.grab(region)
+            img = Image.frombytes(
+                "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
+            )
+            ocr_img = _preprocess_for_ocr(img)
+            _extract_text_blocks(ocr_img, scale=OCR_UPSCALE, dump_ocr=True)
+            self.after(0, lambda: messagebox.showinfo(
+                APP_NAME,
+                "OCRデータをデスクトップの ocr_dump.txt に保存しました。"
+            ))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror(APP_NAME, str(e)))
 
     def _on_overlay_click(self):
         self._prev_first_word = None
