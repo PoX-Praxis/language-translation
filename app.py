@@ -843,6 +843,9 @@ def _extract_text_blocks(ocr_img, scale=1.0, dump_ocr=False):
             continue
         if text_len < 3:
             continue
+        stripped_symbols = re.sub(r'[\d%$€¥£@#&*+=/\\|<>~^°℃℉\s.,;:\-_()\[\]{}]+', '', full_text)
+        if not stripped_symbols:
+            continue
         pad_x = 6
         pad_y = 4
         raw_x = b["x"]
@@ -894,6 +897,16 @@ def _restore_numerics(text, placeholders):
 def _is_chart_block(block, img):
     if not ENABLE_CHART_DETECTION:
         return False
+    text = block["text"]
+    words = text.split()
+    total_words = max(1, len(words))
+    has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
+    number_ratio = has_many_numbers / total_words
+    if number_ratio > 0.5:
+        return True
+    pct_count = text.count('%')
+    if pct_count >= 3:
+        return True
     x, y, w, h = block["x"], block["y"], block["w"], block["h"]
     iw, ih = img.size
     crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
@@ -902,11 +915,6 @@ def _is_chart_block(block, img):
         return False
     unique_colors = len(np.unique(arr.reshape(-1, 3), axis=0))
     color_ratio = unique_colors / max(1, arr.shape[0] * arr.shape[1])
-    has_many_numbers = sum(1 for w in block["text"].split() if re.match(r'[\$€¥£]?\d', w))
-    total_words = max(1, len(block["text"].split()))
-    number_ratio = has_many_numbers / total_words
-    if number_ratio > 0.5:
-        return True
     if color_ratio < 0.05 and block["median_char_h"] < 18:
         return True
     return False
@@ -1088,6 +1096,8 @@ def _render_inplace(base_img, blocks, translations, scale_pct):
     for block, translated in translation_order:
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
         is_chart = block.get("is_chart", False)
+        if is_chart:
+            continue
         bg_color, fg_color = _region_colors(base_img, x, y, w, h)
 
         pad = BOX_PADDING_PX
@@ -1302,6 +1312,8 @@ class ScreenTranslator(tk.Tk):
             # Collect all individual translation tasks
             all_tasks = []  # (block_idx, sub_idx_or_None, text)
             for i, b in enumerate(blocks):
+                if b.get("is_chart"):
+                    continue
                 if b.get("is_toc") and b.get("toc_pages"):
                     headings = block_texts[i].split("\n")
                     for si, h in enumerate(headings):
