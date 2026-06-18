@@ -375,6 +375,8 @@ _TRAILING_NOISE_RE = re.compile(r'\s+[ceo.\s]{10,}\s*\d*\s*$')
 _DOT_CHARS = set('.·•‥…・･。｡●○◯◦⋅∙⠂⠄')
 _REPEATED_CHAR_RE = re.compile(r'(.)\1{3,}')
 _OCR_NOISE_CHARS = set('econsatl')
+_CIRCLED_DIGITS = set('①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳⓪')
+_CIRCLED_DIGIT_RE = re.compile(r'[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳⓪]+')
 
 
 _DIGIT_DOT_JUNK_RE = re.compile(r'^[\d.]+$')
@@ -407,8 +409,11 @@ def _is_ocr_noise_word(text, conf):
 
 
 def _clean_ocr_word(text, conf):
-    """Clean an OCR word: strip trailing dots, return cleaned text or empty if noise."""
+    """Clean an OCR word: strip trailing dots and circled digits, return cleaned text or empty if noise."""
     s = text.strip()
+    if not s:
+        return ""
+    s = _CIRCLED_DIGIT_RE.sub('', s)
     if not s:
         return ""
     cleaned = _strip_trailing_dots(s)
@@ -1302,6 +1307,9 @@ class ScreenTranslator(tk.Tk):
                     for si, h in enumerate(headings):
                         h = h.strip()
                         if h:
+                            words = h.split()
+                            if len(words) >= 2 and all(len(w) <= 4 for w in words):
+                                h = "".join(words)
                             all_tasks.append((i, si, h))
                 else:
                     all_tasks.append((i, None, block_texts[i]))
