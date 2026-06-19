@@ -967,6 +967,122 @@ def _find_table_regions(img):
     return regions
 
 
+def _dedupe_positions(positions, gap=3):
+    """Merge nearby line positions into single positions."""
+    if not positions:
+        return []
+    positions = sorted(set(positions))
+    merged = [positions[0]]
+    for p in positions[1:]:
+        if p - merged[-1] > gap:
+            merged.append(p)
+    return merged
+
+
+def _find_table_cells(img, region):
+    """Find individual cells within a table region by detecting grid lines.
+
+    Returns list of (x, y, w, h) cell bounding boxes.
+    """
+    rx1, ry1, rx2, ry2 = region
+    crop = img.crop((rx1, ry1, rx2, ry2))
+    gray = np.array(crop.convert("L"))
+    if gray.size == 0:
+        return []
+    ch, cw = gray.shape
+    dark = gray < 80
+
+    min_hlen = int(cw * 0.15)
+    h_rows = []
+    for row in range(ch):
+        run = 0
+        for col in range(cw):
+            if dark[row, col]:
+                run += 1
+                if run >= min_hlen:
+                    h_rows.append(row)
+                    break
+            else:
+                run = 0
+
+    min_vlen = max(30, int(ch * 0.2))
+    v_cols = []
+    for col in range(cw):
+        run = 0
+        max_run = 0
+        for row in range(ch):
+            if dark[row, col]:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+        if max_run >= min_vlen:
+            neighbors_dark = 0
+            for dc in [-3, -2, 2, 3]:
+                nc = col + dc
+                if 0 <= nc < cw:
+                    nrun = 0
+                    for row in range(ch):
+                        if dark[row, nc]:
+                            nrun += 1
+                        else:
+                            nrun = 0
+                        if nrun >= min_vlen:
+                            neighbors_dark += 1
+                            break
+            if neighbors_dark <= 1:
+                v_cols.append(col)
+
+    h_lines = _dedupe_positions(h_rows, gap=15)
+    v_lines = _dedupe_positions(v_cols, gap=5)
+
+    if len(h_lines) < 2 or len(v_lines) < 2:
+        return []
+
+    cells = []
+    for i in range(len(h_lines) - 1):
+        for j in range(len(v_lines) - 1):
+            cy = h_lines[i]
+            cy2 = h_lines[i + 1]
+            cx = v_lines[j]
+            cx2 = v_lines[j + 1]
+            cell_w = cx2 - cx
+            cell_h = cy2 - cy
+            if cell_w < 20 or cell_h < 20:
+                continue
+            pad = 3
+            cells.append((
+                rx1 + cx + pad,
+                ry1 + cy + pad,
+                max(1, cell_w - pad * 2),
+                max(1, cell_h - pad * 2),
+            ))
+    return cells
+
+
+def _ocr_cell(img, cell, scale=2.0):
+    """OCR a single table cell and return the text."""
+    x, y, w, h = cell
+    iw, ih = img.size
+    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
+    sw = int(crop.size[0] * scale)
+    sh = int(crop.size[1] * scale)
+    if sw < 10 or sh < 10:
+        return ""
+    upscaled = crop.resize((sw, sh), Image.LANCZOS)
+    enhancer = ImageEnhance.Contrast(upscaled)
+    enhanced = enhancer.enhance(1.5)
+    tess_config = f"--oem {TESS_OEM} --psm 7"
+    try:
+        text = pytesseract.image_to_string(
+            enhanced, lang=TESS_LANG, config=tess_config,
+        ).strip()
+    except Exception:
+        text = ""
+    text = re.sub(r'[|]', '', text)
+    return text.strip()
+
+
 def _is_table_block(block, table_regions):
     """Check if a block falls within any detected table region, or has pipe/dollar patterns."""
     text = block["text"]
@@ -1084,7 +1200,7 @@ def _expand_blocks(blocks, translations, img_h, scale_pct):
         orig_idx = block_map.get(id(b))
         if orig_idx is None:
             continue
-        if b.get("is_toc"):
+        if b.get("is_toc") or b.get("is_table_cell"):
             continue
         translated = translations[orig_idx]
         pad = BOX_PADDING_PX
@@ -1396,6 +1512,32 @@ class ScreenTranslator(tk.Tk):
                         b["is_table"] = False
                 else:
                     b["is_table"] = False
+
+            # --- Table cell extraction: OCR each cell individually ---
+            for region_box in table_regions:
+                cells = _find_table_cells(img, region_box)
+                for cell in cells:
+                    cx, cy, cw, ch_cell = cell
+                    cell_text = _ocr_cell(img, cell)
+                    if not cell_text or len(cell_text.strip()) < 2:
+                        continue
+                    stripped = re.sub(
+                        r'[\d%$€¥£@#&*+=/\\|<>~^°℃℉\s.,;:\-_()\[\]{}]+',
+                        '', cell_text,
+                    )
+                    if not stripped:
+                        continue
+                    blocks.append({
+                        "x": cx, "y": cy, "w": cw, "h": ch_cell,
+                        "text": cell_text,
+                        "median_char_h": max(10, ch_cell // 2),
+                        "median_conf": 80,
+                        "is_chart": False,
+                        "is_table": False,
+                        "is_toc": False,
+                        "toc_pages": None,
+                        "is_table_cell": True,
+                    })
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
