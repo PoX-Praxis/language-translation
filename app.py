@@ -1344,6 +1344,7 @@ class ScreenTranslator(tk.Tk):
         if not self._lock.acquire(blocking=False):
             return
         try:
+            diag_path = os.path.join(os.path.expanduser("~"), "Desktop", "translate_diag.txt")
             region = self.capture_frame.get_inner_region()
             with mss.mss() as sct:
                 screenshot = sct.grab(region)
@@ -1358,7 +1359,8 @@ class ScreenTranslator(tk.Tk):
 
             if not blocks:
                 self._prev_first_word = None
-                print(f"[DIAG] No blocks extracted from OCR")
+                with open(diag_path, "w", encoding="utf-8") as f:
+                    f.write("[DIAG] No blocks extracted from OCR\n")
                 return
 
             all_text = " ".join(b["text"] for b in blocks)
@@ -1378,10 +1380,13 @@ class ScreenTranslator(tk.Tk):
             chart_count = sum(1 for b in blocks if b["is_chart"])
             table_count = sum(1 for b in blocks if b["is_table"])
             normal_count = len(blocks) - chart_count - table_count
-            print(f"[DIAG] Blocks: total={len(blocks)}, normal={normal_count}, chart={chart_count}, table={table_count}")
+            diag_lines = []
+            diag_lines.append(f"Blocks: total={len(blocks)}, normal={normal_count}, chart={chart_count}, table={table_count}")
             for i, b in enumerate(blocks):
                 status = "CHART" if b["is_chart"] else ("TABLE" if b["is_table"] else "OK")
-                print(f"[DIAG]   [{i}] {status} conf={b['median_conf']} text={b['text'][:60]!r}")
+                diag_lines.append(f"  [{i}] {status} conf={b['median_conf']} text={b['text'][:80]!r}")
+            with open(diag_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(diag_lines) + "\n")
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
@@ -1416,9 +1421,11 @@ class ScreenTranslator(tk.Tk):
                     all_tasks.append((i, None, block_texts[i]))
 
             if not all_tasks:
-                print(f"[DIAG] All blocks skipped - no translation tasks")
+                with open(diag_path, "a", encoding="utf-8") as f:
+                    f.write("ALL BLOCKS SKIPPED - no translation tasks\n")
                 return
-            print(f"[DIAG] Sending {len(all_tasks)} texts to DeepL")
+            with open(diag_path, "a", encoding="utf-8") as f:
+                f.write(f"Sending {len(all_tasks)} texts to DeepL\n")
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=4,
