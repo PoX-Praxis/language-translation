@@ -1403,6 +1403,9 @@ class ScreenTranslator(tk.Tk):
                 else:
                     all_tasks.append((i, None, block_texts[i]))
 
+            if not all_tasks:
+                return
+
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=4,
             ) as pool:
