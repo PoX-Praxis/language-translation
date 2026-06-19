@@ -973,16 +973,6 @@ def _is_chart_block(block, img):
     number_ratio = has_many_numbers / total_words
     if number_ratio > 0.5 and total_words < 10:
         return True
-    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-    iw, ih = img.size
-    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
-    arr = np.array(crop)
-    if arr.size == 0:
-        return False
-    unique_colors = len(np.unique(arr.reshape(-1, 3), axis=0))
-    color_ratio = unique_colors / max(1, arr.shape[0] * arr.shape[1])
-    if color_ratio < 0.05 and block["median_char_h"] < 18:
-        return True
     return False
 
 
