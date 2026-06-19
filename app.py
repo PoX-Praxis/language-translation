@@ -917,7 +917,7 @@ def _is_table_block(block, img):
     words = text.split()
     if len(words) >= 4:
         dollar_count = sum(1 for w in words if re.match(r'\$[\d.,]+', w))
-        if dollar_count >= 3:
+        if dollar_count >= 3 and dollar_count / len(words) > 0.15:
             return True
     x, y, w, h = block["x"], block["y"], block["w"], block["h"]
     if w < 60 or h < 40:
@@ -928,6 +928,9 @@ def _is_table_block(block, img):
     if gray.size == 0:
         return False
     ch, cw = gray.shape
+    bg_median = int(np.median(gray))
+    if bg_median < 100:
+        return False
     dark = gray < 80
     min_line_len_h = int(cw * 0.3)
     min_line_len_v = int(ch * 0.2)
