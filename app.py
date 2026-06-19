@@ -297,6 +297,9 @@ def _preprocess_for_ocr(pil_img):
     thresh = _otsu_threshold(arr)
     binary = ((arr > thresh) * 255).astype(np.uint8)
 
+    if np.mean(binary) < 128:
+        binary = 255 - binary
+
     return Image.fromarray(binary)
 
 
