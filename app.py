@@ -905,6 +905,11 @@ def _find_table_regions(img):
         return []
     ih, iw = gray.shape
     dark = gray < 80
+    light = gray > 180
+
+    overall_dark_ratio = np.sum(dark) / max(1, dark.size)
+    if overall_dark_ratio > 0.5:
+        return []
 
     min_hlen = int(iw * 0.15)
     h_line_rows = []
@@ -914,7 +919,12 @@ def _find_table_regions(img):
             if dark[row, col]:
                 run += 1
                 if run >= min_hlen:
-                    h_line_rows.append(row)
+                    above = max(0, row - 5)
+                    below = min(ih - 1, row + 5)
+                    above_light = np.sum(light[above, :]) / max(1, iw)
+                    below_light = np.sum(light[below, :]) / max(1, iw)
+                    if above_light > 0.3 or below_light > 0.3:
+                        h_line_rows.append(row)
                     break
             else:
                 run = 0
@@ -930,7 +940,12 @@ def _find_table_regions(img):
             if dark[row, col]:
                 run += 1
                 if run >= min_vlen:
-                    v_line_cols.append(col)
+                    left = max(0, col - 5)
+                    right = min(iw - 1, col + 5)
+                    left_light = np.sum(light[:, left]) / max(1, ih)
+                    right_light = np.sum(light[:, right]) / max(1, ih)
+                    if left_light > 0.2 or right_light > 0.2:
+                        v_line_cols.append(col)
                     break
             else:
                 run = 0
