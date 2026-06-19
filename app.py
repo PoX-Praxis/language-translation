@@ -895,211 +895,8 @@ def _restore_numerics(text, placeholders):
     return text
 
 
-def _find_table_regions(img):
-    """Scan the full image for rectangular table regions with grid lines.
-
-    Returns a list of (x1, y1, x2, y2) bounding boxes for detected tables.
-    """
-    gray = np.array(img.convert("L"))
-    if gray.size == 0:
-        return []
-    ih, iw = gray.shape
-    dark = gray < 80
-    light = gray > 180
-
-    overall_dark_ratio = np.sum(dark) / max(1, dark.size)
-    if overall_dark_ratio > 0.5:
-        return []
-
-    min_hlen = int(iw * 0.15)
-    h_line_rows = []
-    for row in range(ih):
-        run = 0
-        for col in range(iw):
-            if dark[row, col]:
-                run += 1
-                if run >= min_hlen:
-                    above = max(0, row - 5)
-                    below = min(ih - 1, row + 5)
-                    above_light = np.sum(light[above, :]) / max(1, iw)
-                    below_light = np.sum(light[below, :]) / max(1, iw)
-                    if above_light > 0.3 or below_light > 0.3:
-                        h_line_rows.append(row)
-                    break
-            else:
-                run = 0
-
-    if len(h_line_rows) < 3:
-        return []
-
-    min_vlen = 20
-    v_line_cols = []
-    for col in range(iw):
-        run = 0
-        for row in range(ih):
-            if dark[row, col]:
-                run += 1
-                if run >= min_vlen:
-                    left = max(0, col - 5)
-                    right = min(iw - 1, col + 5)
-                    left_light = np.sum(light[:, left]) / max(1, ih)
-                    right_light = np.sum(light[:, right]) / max(1, ih)
-                    if left_light > 0.2 or right_light > 0.2:
-                        v_line_cols.append(col)
-                    break
-            else:
-                run = 0
-
-    if len(v_line_cols) < 2:
-        return []
-
-    groups = []
-    cur_group = [h_line_rows[0]]
-    for i in range(1, len(h_line_rows)):
-        if h_line_rows[i] - h_line_rows[i - 1] < 80:
-            cur_group.append(h_line_rows[i])
-        else:
-            if len(cur_group) >= 3:
-                groups.append(cur_group)
-            cur_group = [h_line_rows[i]]
-    if len(cur_group) >= 3:
-        groups.append(cur_group)
-
-    regions = []
-    for grp in groups:
-        y1 = grp[0]
-        y2 = grp[-1]
-        cols_in_range = [c for c in v_line_cols
-                         if any(dark[r, c] if 0 <= r < ih else False
-                                for r in range(max(0, y1), min(ih, y2 + 1)))]
-        if len(cols_in_range) >= 2:
-            x1 = min(cols_in_range)
-            x2 = max(cols_in_range)
-            pad = 10
-            regions.append((max(0, x1 - pad), max(0, y1 - pad),
-                            min(iw, x2 + pad), min(ih, y2 + pad)))
-
-    return regions
-
-
-def _dedupe_positions(positions, gap=3):
-    """Merge nearby line positions into single positions."""
-    if not positions:
-        return []
-    positions = sorted(set(positions))
-    merged = [positions[0]]
-    for p in positions[1:]:
-        if p - merged[-1] > gap:
-            merged.append(p)
-    return merged
-
-
-def _find_table_cells(img, region):
-    """Find individual cells within a table region by detecting grid lines.
-
-    Returns list of (x, y, w, h) cell bounding boxes.
-    """
-    rx1, ry1, rx2, ry2 = region
-    crop = img.crop((rx1, ry1, rx2, ry2))
-    gray = np.array(crop.convert("L"))
-    if gray.size == 0:
-        return []
-    ch, cw = gray.shape
-    dark = gray < 80
-
-    min_hlen = int(cw * 0.15)
-    h_rows = []
-    for row in range(ch):
-        run = 0
-        for col in range(cw):
-            if dark[row, col]:
-                run += 1
-                if run >= min_hlen:
-                    h_rows.append(row)
-                    break
-            else:
-                run = 0
-
-    min_vlen = max(30, int(ch * 0.2))
-    v_cols = []
-    for col in range(cw):
-        run = 0
-        max_run = 0
-        for row in range(ch):
-            if dark[row, col]:
-                run += 1
-                max_run = max(max_run, run)
-            else:
-                run = 0
-        if max_run >= min_vlen:
-            neighbors_dark = 0
-            for dc in [-3, -2, 2, 3]:
-                nc = col + dc
-                if 0 <= nc < cw:
-                    nrun = 0
-                    for row in range(ch):
-                        if dark[row, nc]:
-                            nrun += 1
-                        else:
-                            nrun = 0
-                        if nrun >= min_vlen:
-                            neighbors_dark += 1
-                            break
-            if neighbors_dark <= 1:
-                v_cols.append(col)
-
-    h_lines = _dedupe_positions(h_rows, gap=15)
-    v_lines = _dedupe_positions(v_cols, gap=5)
-
-    if len(h_lines) < 2 or len(v_lines) < 2:
-        return []
-
-    cells = []
-    for i in range(len(h_lines) - 1):
-        for j in range(len(v_lines) - 1):
-            cy = h_lines[i]
-            cy2 = h_lines[i + 1]
-            cx = v_lines[j]
-            cx2 = v_lines[j + 1]
-            cell_w = cx2 - cx
-            cell_h = cy2 - cy
-            if cell_w < 20 or cell_h < 20:
-                continue
-            pad = 3
-            cells.append((
-                rx1 + cx + pad,
-                ry1 + cy + pad,
-                max(1, cell_w - pad * 2),
-                max(1, cell_h - pad * 2),
-            ))
-    return cells
-
-
-def _ocr_cell(img, cell, scale=2.0):
-    """OCR a single table cell and return the text."""
-    x, y, w, h = cell
-    iw, ih = img.size
-    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
-    sw = int(crop.size[0] * scale)
-    sh = int(crop.size[1] * scale)
-    if sw < 10 or sh < 10:
-        return ""
-    upscaled = crop.resize((sw, sh), Image.LANCZOS)
-    enhancer = ImageEnhance.Contrast(upscaled)
-    enhanced = enhancer.enhance(1.5)
-    tess_config = f"--oem {TESS_OEM} --psm 7"
-    try:
-        text = pytesseract.image_to_string(
-            enhanced, lang=TESS_LANG, config=tess_config,
-        ).strip()
-    except Exception:
-        text = ""
-    text = re.sub(r'[|]', '', text)
-    return text.strip()
-
-
-def _is_table_block(block, table_regions):
-    """Check if a block falls within any detected table region, or has pipe/dollar patterns."""
+def _is_table_block(block, img):
+    """Detect table/grid structures by finding horizontal and vertical lines."""
     text = block["text"]
     pipe_count = text.count('|')
     if pipe_count >= 3:
@@ -1109,32 +906,64 @@ def _is_table_block(block, table_regions):
         dollar_count = sum(1 for w in words if re.match(r'\$[\d.,]+', w))
         if dollar_count >= 3:
             return True
-    bx1 = block["x"]
-    by1 = block["y"]
-    bx2 = bx1 + block["w"]
-    by2 = by1 + block["h"]
-    for rx1, ry1, rx2, ry2 in table_regions:
-        overlap_x = max(0, min(bx2, rx2) - max(bx1, rx1))
-        overlap_y = max(0, min(by2, ry2) - max(by1, ry1))
-        bw = max(1, bx2 - bx1)
-        bh = max(1, by2 - by1)
-        if overlap_x > bw * 0.5 and overlap_y > bh * 0.5:
-            return True
+    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+    if w < 60 or h < 40:
+        return False
+    iw, ih = img.size
+    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
+    gray = np.array(crop.convert("L"))
+    if gray.size == 0:
+        return False
+    ch, cw = gray.shape
+    dark = gray < 80
+    min_line_len_h = int(cw * 0.3)
+    min_line_len_v = int(ch * 0.2)
+    h_lines = 0
+    for row in range(ch):
+        run = 0
+        for col in range(cw):
+            if dark[row, col]:
+                run += 1
+                if run >= min_line_len_h:
+                    h_lines += 1
+                    break
+            else:
+                run = 0
+    v_lines = 0
+    for col in range(cw):
+        run = 0
+        for row in range(ch):
+            if dark[row, col]:
+                run += 1
+                if run >= min_line_len_v:
+                    v_lines += 1
+                    break
+            else:
+                run = 0
+    if h_lines >= 2 and v_lines >= 2:
+        return True
+    if h_lines >= 3 and v_lines >= 1:
+        return True
+    dark_band_rows = np.sum(dark, axis=1)
+    band_threshold = int(cw * 0.5)
+    band_count = 0
+    in_band = False
+    for r in range(ch):
+        if dark_band_rows[r] >= band_threshold:
+            if not in_band:
+                band_count += 1
+                in_band = True
+        else:
+            in_band = False
+    if band_count >= 1 and h_lines >= 2:
+        return True
     return False
-
-
-_EXPLANATORY_PREFIX_RE = re.compile(
-    r'^(?:Note|Notes|Source|Sources|出典|注|備考|※)\s*[:：\[]',
-    re.IGNORECASE,
-)
 
 
 def _is_chart_block(block, img):
     if not ENABLE_CHART_DETECTION:
         return False
     text = block["text"]
-    if _EXPLANATORY_PREFIX_RE.match(text.strip()):
-        return False
     words = text.split()
     total_words = max(1, len(words))
     pct_count = text.count('%')
@@ -1144,8 +973,17 @@ def _is_chart_block(block, img):
     number_ratio = has_many_numbers / total_words
     if number_ratio > 0.5 and total_words < 10:
         return True
+    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+    iw, ih = img.size
+    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
+    arr = np.array(crop)
+    if arr.size == 0:
+        return False
+    unique_colors = len(np.unique(arr.reshape(-1, 3), axis=0))
+    color_ratio = unique_colors / max(1, arr.shape[0] * arr.shape[1])
+    if color_ratio < 0.05 and block["median_char_h"] < 18:
+        return True
     return False
-
 
 
 def _wrap_text(text, font, max_w, draw):
@@ -1215,7 +1053,7 @@ def _expand_blocks(blocks, translations, img_h, scale_pct):
         orig_idx = block_map.get(id(b))
         if orig_idx is None:
             continue
-        if b.get("is_toc") or b.get("is_table_cell"):
+        if b.get("is_toc"):
             continue
         translated = translations[orig_idx]
         pad = BOX_PADDING_PX
@@ -1518,41 +1356,12 @@ class ScreenTranslator(tk.Tk):
                     and current_first == self._prev_first_word):
                 return
 
-            table_regions = _find_table_regions(img)
             for b in blocks:
                 b["is_chart"] = _is_chart_block(b, img)
                 if not b["is_chart"]:
-                    b["is_table"] = _is_table_block(b, table_regions)
-                    if b["is_table"] and _EXPLANATORY_PREFIX_RE.match(b["text"].strip()):
-                        b["is_table"] = False
+                    b["is_table"] = _is_table_block(b, img)
                 else:
                     b["is_table"] = False
-
-            # --- Table cell extraction: OCR each cell individually ---
-            for region_box in table_regions:
-                cells = _find_table_cells(img, region_box)
-                for cell in cells:
-                    cx, cy, cw, ch_cell = cell
-                    cell_text = _ocr_cell(img, cell)
-                    if not cell_text or len(cell_text.strip()) < 2:
-                        continue
-                    stripped = re.sub(
-                        r'[\d%$€¥£@#&*+=/\\|<>~^°℃℉\s.,;:\-_()\[\]{}]+',
-                        '', cell_text,
-                    )
-                    if not stripped:
-                        continue
-                    blocks.append({
-                        "x": cx, "y": cy, "w": cw, "h": ch_cell,
-                        "text": cell_text,
-                        "median_char_h": max(10, ch_cell // 2),
-                        "median_conf": 80,
-                        "is_chart": False,
-                        "is_table": False,
-                        "is_toc": False,
-                        "toc_pages": None,
-                        "is_table_cell": True,
-                    })
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
