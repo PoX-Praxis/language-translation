@@ -1460,6 +1460,13 @@ class ScreenTranslator(tk.Tk):
                     for t, pm in zip(translations, placeholder_maps)
                 ]
 
+            with open(diag_path, "a", encoding="utf-8") as f:
+                f.write("\n--- Translation results ---\n")
+                for i, (b, t) in enumerate(zip(blocks, translations)):
+                    status = "CHART" if b.get("is_chart") else ("TABLE" if b.get("is_table") else "OK")
+                    f.write(f"[{i}] {status} src={b['text'][:50]!r}\n")
+                    f.write(f"     translated={t[:50]!r}\n")
+
             self._prev_first_word = current_first
 
             scale_pct = self.toolbar.fontsize_pct
@@ -1479,6 +1486,12 @@ class ScreenTranslator(tk.Tk):
                 rx, ry, w, h, result_img,
             )
         except Exception as e:
+            try:
+                with open(diag_path, "a", encoding="utf-8") as f:
+                    f.write(f"EXCEPTION: {e}\n")
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
             traceback.print_exc()
         finally:
             self._lock.release()
