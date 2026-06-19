@@ -979,6 +979,190 @@ def _is_table_block(block, img):
     return False
 
 
+# ---------------------------------------------------------------------------
+# Table cell detection and translation
+# ---------------------------------------------------------------------------
+
+def _detect_table_regions(img):
+    """Detect table grid structures in the full image.
+
+    Returns list of table dicts, each with 'bbox' (x,y,w,h) and 'cells'
+    (list of (cx, cy, cw, ch) cell rectangles).
+    """
+    gray = np.array(img.convert("L"))
+    ih, iw = gray.shape
+    if ih < 40 or iw < 60:
+        return []
+
+    bg_median = int(np.median(gray))
+    if bg_median < 100:
+        return []
+
+    dark = gray < 80
+    min_h_len = int(iw * 0.15)
+    min_v_len = int(ih * 0.08)
+
+    # Find horizontal line y-positions
+    h_line_ys = []
+    for row in range(ih):
+        run = 0
+        max_run = 0
+        for col in range(iw):
+            if dark[row, col]:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+        if max_run >= min_h_len:
+            h_line_ys.append(row)
+
+    # Find vertical line x-positions
+    v_line_xs = []
+    for col in range(iw):
+        run = 0
+        max_run = 0
+        for row in range(ih):
+            if dark[row, col]:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 0
+        if max_run >= min_v_len:
+            v_line_xs.append(col)
+
+    # Cluster nearby lines
+    h_lines = _cluster_line_positions(h_line_ys, gap=5)
+    v_lines = _cluster_line_positions(v_line_xs, gap=5)
+
+    if len(h_lines) < 2 or len(v_lines) < 2:
+        return []
+
+    # Build cells from grid intersections
+    cells = []
+    for i in range(len(h_lines) - 1):
+        for j in range(len(v_lines) - 1):
+            cx = v_lines[j] + 1
+            cy = h_lines[i] + 1
+            cw = v_lines[j + 1] - cx - 1
+            ch = h_lines[i + 1] - cy - 1
+            if cw > 10 and ch > 5:
+                cells.append((cx, cy, cw, ch))
+
+    if not cells:
+        return []
+
+    table_x = min(c[0] for c in cells)
+    table_y = min(c[1] for c in cells)
+    table_r = max(c[0] + c[2] for c in cells)
+    table_b = max(c[1] + c[3] for c in cells)
+
+    return [{
+        "bbox": (table_x, table_y, table_r - table_x, table_b - table_y),
+        "cells": cells,
+        "h_lines": h_lines,
+        "v_lines": v_lines,
+    }]
+
+
+def _cluster_line_positions(positions, gap=5):
+    """Cluster nearby pixel positions into single line positions."""
+    if not positions:
+        return []
+    positions = sorted(set(positions))
+    clusters = []
+    cluster = [positions[0]]
+    for p in positions[1:]:
+        if p - cluster[-1] <= gap:
+            cluster.append(p)
+        else:
+            clusters.append(int(np.mean(cluster)))
+            cluster = [p]
+    clusters.append(int(np.mean(cluster)))
+    return clusters
+
+
+def _ocr_cell(img, cx, cy, cw, ch):
+    """OCR a single table cell region."""
+    iw, ih = img.size
+    pad = 2
+    crop = img.crop((
+        max(0, cx + pad), max(0, cy + pad),
+        min(iw, cx + cw - pad), min(ih, cy + ch - pad),
+    ))
+    if crop.size[0] < 5 or crop.size[1] < 5:
+        return ""
+    scale = max(2.0, OCR_UPSCALE)
+    up_w = int(crop.size[0] * scale)
+    up_h = int(crop.size[1] * scale)
+    upscaled = crop.resize((up_w, up_h), Image.LANCZOS)
+    gray = upscaled.convert("L")
+    enhanced = ImageEnhance.Contrast(gray).enhance(OCR_CONTRAST)
+    arr = np.array(enhanced)
+    thresh = _otsu_threshold(arr)
+    binary = ((arr > thresh) * 255).astype(np.uint8)
+    if np.mean(binary) < 128:
+        binary = 255 - binary
+    ocr_img = Image.fromarray(binary)
+    try:
+        text = pytesseract.image_to_string(
+            ocr_img, lang=TESS_LANG,
+            config=f"--oem {TESS_OEM} --psm 6",
+        ).strip()
+    except Exception:
+        text = ""
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _block_in_table(block, tables):
+    """Check if a text block overlaps with any detected table region."""
+    bx, by = block["x"], block["y"]
+    bx2, by2 = bx + block["w"], by + block["h"]
+    bcx, bcy = (bx + bx2) // 2, (by + by2) // 2
+    for t in tables:
+        tx, ty, tw, th = t["bbox"]
+        if tx <= bcx <= tx + tw and ty <= bcy <= ty + th:
+            return True
+    return False
+
+
+def _render_cell_text(draw, cx, cy, cw, ch, text, base_img, scale_pct):
+    """Render translated text inside a table cell, shrinking to fit."""
+    if not text.strip():
+        return
+    pad = 3
+    inner_w = max(1, cw - pad * 2)
+    inner_h = max(1, ch - pad * 2)
+
+    bg_color, fg_color = _region_colors(base_img, cx, cy, cw, ch)
+    draw.rectangle([cx + 1, cy + 1, cx + cw - 1, cy + ch - 1], fill=bg_color)
+
+    fs = max(MIN_FONT_PX, min(int(ch * 0.6 * scale_pct / 100), MAX_FONT_PX))
+    font = _find_system_font(fs)
+    line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
+    wrapped = _wrap_text(text, font, inner_w, draw)
+    total_h = _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px)
+
+    while total_h > inner_h and fs > MIN_FONT_PX:
+        fs -= 1
+        line_spacing_px = max(1, int(fs * (LINE_SPACING_RATIO - 1.0)))
+        font = _find_system_font(fs)
+        wrapped = _wrap_text(text, font, inner_w, draw)
+        total_h = _calc_wrapped_height(wrapped, font, fs, draw, line_spacing_px)
+
+    dy = cy + pad
+    for line in wrapped:
+        if not line:
+            dy += fs // 2
+            continue
+        bbox = draw.textbbox((0, 0), line, font=font)
+        line_h = bbox[3] - bbox[1] + line_spacing_px
+        if dy + line_h > cy + ch - pad:
+            break
+        draw.text((cx + pad, dy), line, fill=fg_color, font=font)
+        dy += line_h
+
+
 def _is_chart_block(block, img):
     if not ENABLE_CHART_DETECTION:
         return False
@@ -1152,9 +1336,16 @@ def _render_toc_block(draw, block, translated, x, y, w, h, pad, fg_color, scale_
         dy += line_h
 
 
-def _render_inplace(base_img, blocks, translations, scale_pct):
+def _render_inplace(base_img, blocks, translations, scale_pct,
+                     table_cell_data=None):
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
+
+    # Render table cells first (preserving grid lines)
+    if table_cell_data:
+        for cx, cy, cw, ch, translated in table_cell_data:
+            _render_cell_text(draw, cx, cy, cw, ch, translated,
+                              base_img, scale_pct)
 
     img_h = base_img.size[1]
     _expand_blocks(blocks, translations, img_h, scale_pct)
@@ -1333,6 +1524,7 @@ class ScreenTranslator(tk.Tk):
             scale_pct = self.toolbar.fontsize_pct
             result_img = _render_inplace(
                 lr["img"], lr["blocks"], lr["translations"], scale_pct,
+                table_cell_data=lr.get("table_cell_data"),
             )
             self.overlay.show_at(
                 lr["x"], lr["y"], lr["w"], lr["h"], result_img,
@@ -1367,10 +1559,16 @@ class ScreenTranslator(tk.Tk):
                     and current_first == self._prev_first_word):
                 return
 
+            # Detect table regions in the image
+            table_regions = _detect_table_regions(img)
+
             for b in blocks:
                 b["is_chart"] = _is_chart_block(b, img)
                 if not b["is_chart"]:
-                    b["is_table"] = _is_table_block(b, img)
+                    if table_regions and _block_in_table(b, table_regions):
+                        b["is_table"] = True
+                    else:
+                        b["is_table"] = _is_table_block(b, img)
                 else:
                     b["is_table"] = False
 
@@ -1378,6 +1576,34 @@ class ScreenTranslator(tk.Tk):
                 self.toolbar.lang_var.get(), "en",
             )
 
+            # --- Table cell translation ---
+            table_cell_data = []
+            if table_regions:
+                cell_tasks = []
+                for table in table_regions:
+                    for cx, cy, cw, ch in table["cells"]:
+                        cell_text = _ocr_cell(img, cx, cy, cw, ch)
+                        if cell_text:
+                            cell_tasks.append((cx, cy, cw, ch, cell_text))
+                if cell_tasks:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=4,
+                    ) as pool:
+                        cell_futures = [
+                            pool.submit(
+                                self._engine.translate, ct[4], target_code,
+                            )
+                            for ct in cell_tasks
+                        ]
+                        cell_results = [f.result()[0] for f in cell_futures]
+                    for (cx, cy, cw, ch, _src), translated in zip(
+                        cell_tasks, cell_results,
+                    ):
+                        table_cell_data.append(
+                            (cx, cy, cw, ch, translated)
+                        )
+
+            # --- Normal text translation ---
             block_texts = []
             placeholder_maps = []
             for b in blocks:
@@ -1389,8 +1615,7 @@ class ScreenTranslator(tk.Tk):
                 block_texts.append(text)
                 placeholder_maps.append(pmap)
 
-            # Collect all individual translation tasks
-            all_tasks = []  # (block_idx, sub_idx_or_None, text)
+            all_tasks = []
             for i, b in enumerate(blocks):
                 if b.get("is_chart") or b.get("is_table"):
                     continue
@@ -1406,28 +1631,31 @@ class ScreenTranslator(tk.Tk):
                 else:
                     all_tasks.append((i, None, block_texts[i]))
 
-            if not all_tasks:
+            if not all_tasks and not table_cell_data:
                 return
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=4,
-            ) as pool:
-                futures = [
-                    pool.submit(self._engine.translate, task[2], target_code)
-                    for task in all_tasks
-                ]
-                results = [f.result()[0] for f in futures]
-
             translations = [""] * len(blocks)
-            toc_heading_map = {}
-            for (bi, si, _), translated in zip(all_tasks, results):
-                if si is None:
-                    translations[bi] = translated
-                else:
-                    toc_heading_map.setdefault(bi, [])
-                    toc_heading_map[bi].append(translated)
-            for bi, heads in toc_heading_map.items():
-                translations[bi] = "\n".join(heads)
+            if all_tasks:
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4,
+                ) as pool:
+                    futures = [
+                        pool.submit(
+                            self._engine.translate, task[2], target_code,
+                        )
+                        for task in all_tasks
+                    ]
+                    results = [f.result()[0] for f in futures]
+
+                toc_heading_map = {}
+                for (bi, si, _), translated in zip(all_tasks, results):
+                    if si is None:
+                        translations[bi] = translated
+                    else:
+                        toc_heading_map.setdefault(bi, [])
+                        toc_heading_map[bi].append(translated)
+                for bi, heads in toc_heading_map.items():
+                    translations[bi] = "\n".join(heads)
 
             if PROTECT_NUMERIC:
                 translations = [
@@ -1440,11 +1668,15 @@ class ScreenTranslator(tk.Tk):
             scale_pct = self.toolbar.fontsize_pct
             w, h = region["width"], region["height"]
             rx, ry = region["left"], region["top"]
-            result_img = _render_inplace(img, blocks, translations, scale_pct)
+            result_img = _render_inplace(
+                img, blocks, translations, scale_pct,
+                table_cell_data=table_cell_data,
+            )
 
             self._last_render = {
                 "img": img, "blocks": blocks,
                 "translations": translations,
+                "table_cell_data": table_cell_data,
                 "x": rx, "y": ry, "w": w, "h": h,
             }
 
