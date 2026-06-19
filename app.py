@@ -895,8 +895,80 @@ def _restore_numerics(text, placeholders):
     return text
 
 
-def _is_table_block(block, img):
-    """Detect table/grid structures by finding horizontal and vertical lines."""
+def _find_table_regions(img):
+    """Scan the full image for rectangular table regions with grid lines.
+
+    Returns a list of (x1, y1, x2, y2) bounding boxes for detected tables.
+    """
+    gray = np.array(img.convert("L"))
+    if gray.size == 0:
+        return []
+    ih, iw = gray.shape
+    dark = gray < 80
+
+    min_hlen = int(iw * 0.15)
+    h_line_rows = []
+    for row in range(ih):
+        run = 0
+        for col in range(iw):
+            if dark[row, col]:
+                run += 1
+                if run >= min_hlen:
+                    h_line_rows.append(row)
+                    break
+            else:
+                run = 0
+
+    if len(h_line_rows) < 3:
+        return []
+
+    min_vlen = 20
+    v_line_cols = []
+    for col in range(iw):
+        run = 0
+        for row in range(ih):
+            if dark[row, col]:
+                run += 1
+                if run >= min_vlen:
+                    v_line_cols.append(col)
+                    break
+            else:
+                run = 0
+
+    if len(v_line_cols) < 2:
+        return []
+
+    groups = []
+    cur_group = [h_line_rows[0]]
+    for i in range(1, len(h_line_rows)):
+        if h_line_rows[i] - h_line_rows[i - 1] < 80:
+            cur_group.append(h_line_rows[i])
+        else:
+            if len(cur_group) >= 3:
+                groups.append(cur_group)
+            cur_group = [h_line_rows[i]]
+    if len(cur_group) >= 3:
+        groups.append(cur_group)
+
+    regions = []
+    for grp in groups:
+        y1 = grp[0]
+        y2 = grp[-1]
+        cols_in_range = [c for c in v_line_cols
+                         if any(dark[r, c] if 0 <= r < ih else False
+                                for r in range(max(0, y1), min(ih, y2 + 1)))]
+        if len(cols_in_range) >= 2:
+            x1 = min(cols_in_range)
+            x2 = max(cols_in_range)
+            pad = 10
+            regions.append((max(0, x1 - pad), max(0, y1 - pad),
+                            min(iw, x2 + pad), min(ih, y2 + pad)))
+
+    return regions
+
+
+def _is_table_block(block, table_regions):
+    """Check if a block falls within any detected table region, or has pipe/dollar patterns."""
     text = block["text"]
     pipe_count = text.count('|')
     if pipe_count >= 3:
@@ -906,74 +978,43 @@ def _is_table_block(block, img):
         dollar_count = sum(1 for w in words if re.match(r'\$[\d.,]+', w))
         if dollar_count >= 3:
             return True
-    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-    if w < 60 or h < 40:
-        return False
-    iw, ih = img.size
-    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
-    gray = np.array(crop.convert("L"))
-    if gray.size == 0:
-        return False
-    ch, cw = gray.shape
-    dark = gray < 80
-    min_line_len_h = int(cw * 0.3)
-    min_line_len_v = int(ch * 0.2)
-    h_lines = 0
-    for row in range(ch):
-        run = 0
-        for col in range(cw):
-            if dark[row, col]:
-                run += 1
-                if run >= min_line_len_h:
-                    h_lines += 1
-                    break
-            else:
-                run = 0
-    v_lines = 0
-    for col in range(cw):
-        run = 0
-        for row in range(ch):
-            if dark[row, col]:
-                run += 1
-                if run >= min_line_len_v:
-                    v_lines += 1
-                    break
-            else:
-                run = 0
-    if h_lines >= 2 and v_lines >= 2:
-        return True
-    if h_lines >= 3 and v_lines >= 1:
-        return True
-    dark_band_rows = np.sum(dark, axis=1)
-    band_threshold = int(cw * 0.5)
-    band_count = 0
-    in_band = False
-    for r in range(ch):
-        if dark_band_rows[r] >= band_threshold:
-            if not in_band:
-                band_count += 1
-                in_band = True
-        else:
-            in_band = False
-    if band_count >= 1 and h_lines >= 3:
-        return True
+    bx1 = block["x"]
+    by1 = block["y"]
+    bx2 = bx1 + block["w"]
+    by2 = by1 + block["h"]
+    for rx1, ry1, rx2, ry2 in table_regions:
+        overlap_x = max(0, min(bx2, rx2) - max(bx1, rx1))
+        overlap_y = max(0, min(by2, ry2) - max(by1, ry1))
+        bw = max(1, bx2 - bx1)
+        bh = max(1, by2 - by1)
+        if overlap_x > bw * 0.5 and overlap_y > bh * 0.5:
+            return True
     return False
+
+
+_EXPLANATORY_PREFIX_RE = re.compile(
+    r'^(?:Note|Notes|Source|Sources|出典|注|備考|※)\s*[:：\[]',
+    re.IGNORECASE,
+)
 
 
 def _is_chart_block(block, img):
     if not ENABLE_CHART_DETECTION:
         return False
     text = block["text"]
+    if _EXPLANATORY_PREFIX_RE.match(text.strip()):
+        return False
     words = text.split()
     total_words = max(1, len(words))
     pct_count = text.count('%')
-    if pct_count >= 3:
+    if pct_count >= 3 and total_words < 15:
         return True
     has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
     number_ratio = has_many_numbers / total_words
     if number_ratio > 0.5 and total_words < 10:
         return True
     return False
+
 
 
 def _wrap_text(text, font, max_w, draw):
@@ -1346,10 +1387,13 @@ class ScreenTranslator(tk.Tk):
                     and current_first == self._prev_first_word):
                 return
 
+            table_regions = _find_table_regions(img)
             for b in blocks:
                 b["is_chart"] = _is_chart_block(b, img)
                 if not b["is_chart"]:
-                    b["is_table"] = _is_table_block(b, img)
+                    b["is_table"] = _is_table_block(b, table_regions)
+                    if b["is_table"] and _EXPLANATORY_PREFIX_RE.match(b["text"].strip()):
+                        b["is_table"] = False
                 else:
                     b["is_table"] = False
 
