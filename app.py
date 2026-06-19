@@ -1081,6 +1081,101 @@ def _cluster_line_positions(positions, gap=5):
     return clusters
 
 
+def _ollama_extract_table(img, table_region):
+    """Use Ollama vision model to extract table cell contents.
+
+    Returns list of (cx, cy, cw, ch, text) or None if Ollama unavailable.
+    """
+    import base64
+    import io
+
+    tx, ty, tw, th = table_region["bbox"]
+    iw, ih = img.size
+    crop = img.crop((max(0, tx), max(0, ty),
+                     min(iw, tx + tw), min(ih, ty + th)))
+
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    prompt = (
+        "This image shows a table. Extract ALL text content from each cell.\n"
+        "Return ONLY a JSON array of objects with these fields:\n"
+        '  "row": row index (0-based, top to bottom)\n'
+        '  "col": column index (0-based, left to right)\n'
+        '  "text": the text content of the cell\n'
+        "Rules:\n"
+        "- Include header rows (row 0 is usually the header)\n"
+        "- For cells with only numbers, currency, or percentages, "
+        "set text to the exact value as-is\n"
+        "- For empty cells, omit them\n"
+        "- Do NOT translate, just extract the original text\n"
+        "Return ONLY the JSON array, no other text."
+    )
+
+    try:
+        req_data = json.dumps({
+            "model": "gemma3:12b",
+            "prompt": prompt,
+            "images": [img_b64],
+            "stream": False,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+
+        response_text = resp_data.get("response", "")
+        # Extract JSON from response
+        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+        if not json_match:
+            return None
+        cells_data = json.loads(json_match.group())
+    except Exception:
+        return None
+
+    if not cells_data or not isinstance(cells_data, list):
+        return None
+
+    # Map row/col to pixel positions using detected grid lines
+    h_lines = table_region.get("h_lines", [])
+    v_lines = table_region.get("v_lines", [])
+
+    if len(h_lines) < 2 or len(v_lines) < 2:
+        return None
+
+    result = []
+    for cell in cells_data:
+        if not isinstance(cell, dict):
+            continue
+        row = cell.get("row", -1)
+        col = cell.get("col", -1)
+        text = cell.get("text", "").strip()
+        if not text or row < 0 or col < 0:
+            continue
+        if row >= len(h_lines) - 1 or col >= len(v_lines) - 1:
+            continue
+        cx = v_lines[col] + 1
+        cy = h_lines[row] + 1
+        cw = v_lines[col + 1] - cx - 1
+        ch_px = h_lines[row + 1] - cy - 1
+        if cw > 5 and ch_px > 5:
+            result.append((cx, cy, cw, ch_px, text))
+
+    return result if result else None
+
+
+def _is_numeric_only(text):
+    """Check if text is purely numeric/currency (no need to translate)."""
+    cleaned = re.sub(r'[\s\$€¥£%,.\-+()trn\d]', '', text, flags=re.IGNORECASE)
+    return len(cleaned) == 0
+
+
 def _ocr_cell(img, cx, cy, cw, ch):
     """OCR a single table cell region."""
     iw, ih = img.size
@@ -1579,29 +1674,55 @@ class ScreenTranslator(tk.Tk):
             # --- Table cell translation ---
             table_cell_data = []
             if table_regions:
-                cell_tasks = []
                 for table in table_regions:
-                    for cx, cy, cw, ch in table["cells"]:
-                        cell_text = _ocr_cell(img, cx, cy, cw, ch)
-                        if cell_text:
-                            cell_tasks.append((cx, cy, cw, ch, cell_text))
-                if cell_tasks:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=4,
-                    ) as pool:
-                        cell_futures = [
-                            pool.submit(
-                                self._engine.translate, ct[4], target_code,
-                            )
-                            for ct in cell_tasks
+                    # Try Ollama VLM first
+                    ollama_cells = _ollama_extract_table(img, table)
+                    if ollama_cells:
+                        cell_tasks = [
+                            (cx, cy, cw, ch, text)
+                            for cx, cy, cw, ch, text in ollama_cells
+                            if not _is_numeric_only(text)
                         ]
-                        cell_results = [f.result()[0] for f in cell_futures]
-                    for (cx, cy, cw, ch, _src), translated in zip(
-                        cell_tasks, cell_results,
-                    ):
-                        table_cell_data.append(
-                            (cx, cy, cw, ch, translated)
-                        )
+                        # Keep numeric cells as-is (no translation)
+                        for cx, cy, cw, ch, text in ollama_cells:
+                            if _is_numeric_only(text):
+                                table_cell_data.append(
+                                    (cx, cy, cw, ch, text)
+                                )
+                    else:
+                        # Fallback: Tesseract per-cell OCR
+                        cell_tasks = []
+                        for cx, cy, cw, ch in table["cells"]:
+                            cell_text = _ocr_cell(img, cx, cy, cw, ch)
+                            if cell_text and not _is_numeric_only(cell_text):
+                                cell_tasks.append(
+                                    (cx, cy, cw, ch, cell_text)
+                                )
+                            elif cell_text:
+                                table_cell_data.append(
+                                    (cx, cy, cw, ch, cell_text)
+                                )
+
+                    if cell_tasks:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=4,
+                        ) as pool:
+                            cell_futures = [
+                                pool.submit(
+                                    self._engine.translate, ct[4],
+                                    target_code,
+                                )
+                                for ct in cell_tasks
+                            ]
+                            cell_results = [
+                                f.result()[0] for f in cell_futures
+                            ]
+                        for (cx, cy, cw, ch, _src), translated in zip(
+                            cell_tasks, cell_results,
+                        ):
+                            table_cell_data.append(
+                                (cx, cy, cw, ch, translated)
+                            )
 
             # --- Normal text translation ---
             block_texts = []
@@ -1779,6 +1900,24 @@ def _run_diagnostics():
             lines.append("[--] VLM re-OCR: disabled (torch not installed)")
     except ImportError:
         lines.append("[--] VLM re-OCR: disabled (local_ocr.py not found)")
+
+    # Ollama
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/tags",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+        models = [m["name"] for m in tags.get("models", [])]
+        has_vision = any("gemma3" in m for m in models)
+        lines.append(f"[OK] Ollama: running ({len(models)} models)")
+        if has_vision:
+            lines.append("[OK] Ollama vision: gemma3 available")
+        else:
+            lines.append("[--] Ollama vision: gemma3 not found (run: ollama pull gemma3:12b)")
+    except Exception:
+        lines.append("[--] Ollama: not running")
 
     # DeepL
     api_key = _load_api_key()
