@@ -895,6 +895,60 @@ def _restore_numerics(text, placeholders):
     return text
 
 
+def _is_table_block(block, img):
+    """Detect table/grid structures by finding horizontal and vertical lines."""
+    x, y, w, h = block["x"], block["y"], block["w"], block["h"]
+    if w < 60 or h < 40:
+        return False
+    iw, ih = img.size
+    crop = img.crop((max(0, x), max(0, y), min(iw, x + w), min(ih, y + h)))
+    gray = np.array(crop.convert("L"))
+    if gray.size == 0:
+        return False
+    ch, cw = gray.shape
+    dark = gray < 80
+    min_line_len_h = int(cw * 0.4)
+    min_line_len_v = int(ch * 0.25)
+    h_lines = 0
+    for row in range(ch):
+        run = 0
+        for col in range(cw):
+            if dark[row, col]:
+                run += 1
+                if run >= min_line_len_h:
+                    h_lines += 1
+                    break
+            else:
+                run = 0
+    v_lines = 0
+    for col in range(cw):
+        run = 0
+        for row in range(ch):
+            if dark[row, col]:
+                run += 1
+                if run >= min_line_len_v:
+                    v_lines += 1
+                    break
+            else:
+                run = 0
+    if h_lines >= 3 and v_lines >= 2:
+        return True
+    dark_band_rows = np.sum(dark, axis=1)
+    band_threshold = int(cw * 0.5)
+    band_count = 0
+    in_band = False
+    for r in range(ch):
+        if dark_band_rows[r] >= band_threshold:
+            if not in_band:
+                band_count += 1
+                in_band = True
+        else:
+            in_band = False
+    if band_count >= 1 and h_lines >= 2:
+        return True
+    return False
+
+
 def _is_chart_block(block, img):
     if not ENABLE_CHART_DETECTION:
         return False
@@ -1096,8 +1150,7 @@ def _render_inplace(base_img, blocks, translations, scale_pct):
 
     for block, translated in translation_order:
         x, y, w, h = block["x"], block["y"], block["w"], block["h"]
-        is_chart = block.get("is_chart", False)
-        if is_chart:
+        if block.get("is_chart", False) or block.get("is_table", False):
             continue
         bg_color, fg_color = _region_colors(base_img, x, y, w, h)
 
@@ -1294,6 +1347,10 @@ class ScreenTranslator(tk.Tk):
 
             for b in blocks:
                 b["is_chart"] = _is_chart_block(b, img)
+                if not b["is_chart"]:
+                    b["is_table"] = _is_table_block(b, img)
+                else:
+                    b["is_table"] = False
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
@@ -1313,7 +1370,7 @@ class ScreenTranslator(tk.Tk):
             # Collect all individual translation tasks
             all_tasks = []  # (block_idx, sub_idx_or_None, text)
             for i, b in enumerate(blocks):
-                if b.get("is_chart"):
+                if b.get("is_chart") or b.get("is_table"):
                     continue
                 if b.get("is_toc") and b.get("toc_pages"):
                     headings = block_texts[i].split("\n")
