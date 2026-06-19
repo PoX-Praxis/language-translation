@@ -16,7 +16,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import traceback
 import urllib.request
-import urllib.error
 import urllib.parse
 
 import numpy as np
@@ -298,6 +297,9 @@ def _preprocess_for_ocr(pil_img):
     thresh = _otsu_threshold(arr)
     binary = ((arr > thresh) * 255).astype(np.uint8)
 
+    if np.mean(binary) < 128:
+        binary = 255 - binary
+
     return Image.fromarray(binary)
 
 
@@ -523,6 +525,7 @@ class CaptureFrame(tk.Toplevel):
         self._resize_data = {"x": 0, "y": 0, "w": 0, "h": 0}
         self._zone = "none"
         self._on_move = None
+        self._cached_region = None
 
         self.canvas = tk.Canvas(self, bg="#010101", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -531,6 +534,7 @@ class CaptureFrame(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", self._update_cached_region)
 
     def set_on_move(self, cb):
         self._on_move = cb
@@ -606,7 +610,18 @@ class CaptureFrame(tk.Toplevel):
     def _on_release(self, event):
         self._zone = "none"
 
+    def _update_cached_region(self, event=None):
+        b = BORDER_WIDTH
+        self._cached_region = {
+            "left": self.winfo_x() + b,
+            "top": self.winfo_y() + b,
+            "width": max(1, self.winfo_width() - b * 2),
+            "height": max(1, self.winfo_height() - b * 2),
+        }
+
     def get_inner_region(self):
+        if self._cached_region is not None:
+            return dict(self._cached_region)
         self.update_idletasks()
         b = BORDER_WIDTH
         return {
@@ -681,6 +696,7 @@ class Toolbar(tk.Toplevel):
         lang_combo.pack(side=tk.LEFT, padx=1)
 
         self.fontsize_var = tk.StringVar(value="100")
+        self.fontsize_pct = 100
         self._on_fontsize = None
         self.fontsize_var.trace_add("write", self._on_fontsize_change)
         fontsize_spin = tk.Spinbox(
@@ -717,12 +733,12 @@ class Toolbar(tk.Toplevel):
         self.close_btn.pack(side=tk.LEFT, padx=1)
 
     def _on_fontsize_change(self, *args):
+        try:
+            self.fontsize_pct = int(self.fontsize_var.get())
+        except ValueError:
+            return
         if self._on_fontsize:
-            try:
-                int(self.fontsize_var.get())
-                self._on_fontsize()
-            except ValueError:
-                pass
+            self._on_fontsize()
 
     def _do_toggle(self):
         if self._on_toggle:
@@ -904,7 +920,7 @@ def _is_table_block(block, img):
     words = text.split()
     if len(words) >= 4:
         dollar_count = sum(1 for w in words if re.match(r'\$[\d.,]+', w))
-        if dollar_count >= 3:
+        if dollar_count >= 3 and dollar_count / len(words) > 0.15:
             return True
     x, y, w, h = block["x"], block["y"], block["w"], block["h"]
     if w < 60 or h < 40:
@@ -915,6 +931,9 @@ def _is_table_block(block, img):
     if gray.size == 0:
         return False
     ch, cw = gray.shape
+    bg_median = int(np.median(gray))
+    if bg_median < 100:
+        return False
     dark = gray < 80
     min_line_len_h = int(cw * 0.3)
     min_line_len_v = int(ch * 0.2)
@@ -1210,8 +1229,10 @@ class ScreenTranslator(tk.Tk):
             api_key = _ask_api_key()
         if not api_key:
             messagebox.showerror(APP_NAME, "DeepL API Key が未設定です。終了します。")
+            self._init_ok = False
             self.destroy()
             return
+        self._init_ok = True
         self._engine = DeepLEngine(api_key)
 
         self.running = False
@@ -1309,7 +1330,7 @@ class ScreenTranslator(tk.Tk):
     def _on_fontsize_change(self):
         if self._last_render and self.overlay.is_visible:
             lr = self._last_render
-            scale_pct = int(self.toolbar.fontsize_var.get())
+            scale_pct = self.toolbar.fontsize_pct
             result_img = _render_inplace(
                 lr["img"], lr["blocks"], lr["translations"], scale_pct,
             )
@@ -1385,6 +1406,9 @@ class ScreenTranslator(tk.Tk):
                 else:
                     all_tasks.append((i, None, block_texts[i]))
 
+            if not all_tasks:
+                return
+
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=4,
             ) as pool:
@@ -1413,7 +1437,7 @@ class ScreenTranslator(tk.Tk):
 
             self._prev_first_word = current_first
 
-            scale_pct = int(self.toolbar.fontsize_var.get())
+            scale_pct = self.toolbar.fontsize_pct
             w, h = region["width"], region["height"]
             rx, ry = region["left"], region["top"]
             result_img = _render_inplace(img, blocks, translations, scale_pct)
@@ -1557,7 +1581,8 @@ def main():
         return
 
     app = ScreenTranslator()
-    app.mainloop()
+    if getattr(app, "_init_ok", False):
+        app.mainloop()
 
 
 if __name__ == "__main__":
