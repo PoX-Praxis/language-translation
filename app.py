@@ -1007,7 +1007,7 @@ def _is_chart_block(block, img):
     words = text.split()
     total_words = max(1, len(words))
     pct_count = text.count('%')
-    if pct_count >= 3 and total_words < 15:
+    if pct_count >= 3:
         return True
     has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
     number_ratio = has_many_numbers / total_words
