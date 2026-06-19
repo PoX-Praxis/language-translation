@@ -897,6 +897,15 @@ def _restore_numerics(text, placeholders):
 
 def _is_table_block(block, img):
     """Detect table/grid structures by finding horizontal and vertical lines."""
+    text = block["text"]
+    pipe_count = text.count('|')
+    if pipe_count >= 3:
+        return True
+    words = text.split()
+    if len(words) >= 4:
+        dollar_count = sum(1 for w in words if re.match(r'\$[\d.,]+', w))
+        if dollar_count >= 3:
+            return True
     x, y, w, h = block["x"], block["y"], block["w"], block["h"]
     if w < 60 or h < 40:
         return False
@@ -907,8 +916,8 @@ def _is_table_block(block, img):
         return False
     ch, cw = gray.shape
     dark = gray < 80
-    min_line_len_h = int(cw * 0.4)
-    min_line_len_v = int(ch * 0.25)
+    min_line_len_h = int(cw * 0.3)
+    min_line_len_v = int(ch * 0.2)
     h_lines = 0
     for row in range(ch):
         run = 0
@@ -931,7 +940,9 @@ def _is_table_block(block, img):
                     break
             else:
                 run = 0
-    if h_lines >= 3 and v_lines >= 2:
+    if h_lines >= 2 and v_lines >= 2:
+        return True
+    if h_lines >= 3 and v_lines >= 1:
         return True
     dark_band_rows = np.sum(dark, axis=1)
     band_threshold = int(cw * 0.5)
