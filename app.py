@@ -839,7 +839,8 @@ def _extract_text_blocks(ocr_img, scale=1.0, dump_ocr=False):
         median_conf = int(np.median(b["confs"])) if b["confs"] else 0
         word_count = len(b["words"])
         text_len = len(full_text.strip())
-        if word_count <= 2 and median_conf < CONF_THRESHOLD:
+        has_alpha = any(c.isalpha() for c in full_text)
+        if word_count <= 2 and median_conf < CONF_THRESHOLD and not has_alpha:
             continue
         if text_len < 3:
             continue
@@ -900,6 +901,8 @@ def _is_chart_block(block, img):
     text = block["text"]
     words = text.split()
     total_words = max(1, len(words))
+    if total_words >= 10:
+        return False
     has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
     number_ratio = has_many_numbers / total_words
     if number_ratio > 0.5:
