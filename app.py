@@ -901,14 +901,12 @@ def _is_chart_block(block, img):
     text = block["text"]
     words = text.split()
     total_words = max(1, len(words))
-    if total_words >= 10:
-        return False
-    has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
-    number_ratio = has_many_numbers / total_words
-    if number_ratio > 0.5:
-        return True
     pct_count = text.count('%')
     if pct_count >= 3:
+        return True
+    has_many_numbers = sum(1 for w in words if re.match(r'[\$€¥£%]?\d', w))
+    number_ratio = has_many_numbers / total_words
+    if number_ratio > 0.5 and total_words < 10:
         return True
     x, y, w, h = block["x"], block["y"], block["w"], block["h"]
     iw, ih = img.size
