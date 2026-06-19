@@ -1341,14 +1341,9 @@ class ScreenTranslator(tk.Tk):
     # --- Core translation ---
 
     def _scan_and_translate(self):
-        diag_path = os.path.join(os.path.expanduser("~"), "Desktop", "translate_diag.txt")
         if not self._lock.acquire(blocking=False):
-            with open(diag_path, "w", encoding="utf-8") as f:
-                f.write("BLOCKED: lock held by previous scan\n")
             return
         try:
-            with open(diag_path, "w", encoding="utf-8") as f:
-                f.write("scan_and_translate STARTED\n")
             region = self.capture_frame.get_inner_region()
             with mss.mss() as sct:
                 screenshot = sct.grab(region)
@@ -1363,8 +1358,6 @@ class ScreenTranslator(tk.Tk):
 
             if not blocks:
                 self._prev_first_word = None
-                with open(diag_path, "w", encoding="utf-8") as f:
-                    f.write("No blocks extracted from OCR\n")
                 return
 
             all_text = " ".join(b["text"] for b in blocks)
@@ -1372,9 +1365,6 @@ class ScreenTranslator(tk.Tk):
 
             if (self._prev_first_word is not None
                     and current_first == self._prev_first_word):
-                with open(diag_path, "w", encoding="utf-8") as f:
-                    f.write(f"SKIPPED: same first word '{current_first}'\n")
-                    f.write(f"prev_first_word='{self._prev_first_word}'\n")
                 return
 
             for b in blocks:
@@ -1383,17 +1373,6 @@ class ScreenTranslator(tk.Tk):
                     b["is_table"] = _is_table_block(b, img)
                 else:
                     b["is_table"] = False
-
-            chart_count = sum(1 for b in blocks if b["is_chart"])
-            table_count = sum(1 for b in blocks if b["is_table"])
-            normal_count = len(blocks) - chart_count - table_count
-            diag_lines = []
-            diag_lines.append(f"Blocks: total={len(blocks)}, normal={normal_count}, chart={chart_count}, table={table_count}")
-            for i, b in enumerate(blocks):
-                status = "CHART" if b["is_chart"] else ("TABLE" if b["is_table"] else "OK")
-                diag_lines.append(f"  [{i}] {status} conf={b['median_conf']} text={b['text'][:80]!r}")
-            with open(diag_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(diag_lines) + "\n")
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
@@ -1428,11 +1407,7 @@ class ScreenTranslator(tk.Tk):
                     all_tasks.append((i, None, block_texts[i]))
 
             if not all_tasks:
-                with open(diag_path, "a", encoding="utf-8") as f:
-                    f.write("ALL BLOCKS SKIPPED - no translation tasks\n")
                 return
-            with open(diag_path, "a", encoding="utf-8") as f:
-                f.write(f"Sending {len(all_tasks)} texts to DeepL\n")
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=4,
@@ -1460,13 +1435,6 @@ class ScreenTranslator(tk.Tk):
                     for t, pm in zip(translations, placeholder_maps)
                 ]
 
-            with open(diag_path, "a", encoding="utf-8") as f:
-                f.write("\n--- Translation results ---\n")
-                for i, (b, t) in enumerate(zip(blocks, translations)):
-                    status = "CHART" if b.get("is_chart") else ("TABLE" if b.get("is_table") else "OK")
-                    f.write(f"[{i}] {status} src={b['text'][:50]!r}\n")
-                    f.write(f"     translated={t[:50]!r}\n")
-
             self._prev_first_word = current_first
 
             scale_pct = self.toolbar.fontsize_pct
@@ -1486,12 +1454,6 @@ class ScreenTranslator(tk.Tk):
                 rx, ry, w, h, result_img,
             )
         except Exception as e:
-            try:
-                with open(diag_path, "a", encoding="utf-8") as f:
-                    f.write(f"EXCEPTION: {e}\n")
-                    traceback.print_exc(file=f)
-            except Exception:
-                pass
             traceback.print_exc()
         finally:
             self._lock.release()
