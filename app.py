@@ -1341,10 +1341,14 @@ class ScreenTranslator(tk.Tk):
     # --- Core translation ---
 
     def _scan_and_translate(self):
+        diag_path = os.path.join(os.path.expanduser("~"), "Desktop", "translate_diag.txt")
         if not self._lock.acquire(blocking=False):
+            with open(diag_path, "w", encoding="utf-8") as f:
+                f.write("BLOCKED: lock held by previous scan\n")
             return
         try:
-            diag_path = os.path.join(os.path.expanduser("~"), "Desktop", "translate_diag.txt")
+            with open(diag_path, "w", encoding="utf-8") as f:
+                f.write("scan_and_translate STARTED\n")
             region = self.capture_frame.get_inner_region()
             with mss.mss() as sct:
                 screenshot = sct.grab(region)
@@ -1360,7 +1364,7 @@ class ScreenTranslator(tk.Tk):
             if not blocks:
                 self._prev_first_word = None
                 with open(diag_path, "w", encoding="utf-8") as f:
-                    f.write("[DIAG] No blocks extracted from OCR\n")
+                    f.write("No blocks extracted from OCR\n")
                 return
 
             all_text = " ".join(b["text"] for b in blocks)
@@ -1368,6 +1372,9 @@ class ScreenTranslator(tk.Tk):
 
             if (self._prev_first_word is not None
                     and current_first == self._prev_first_word):
+                with open(diag_path, "w", encoding="utf-8") as f:
+                    f.write(f"SKIPPED: same first word '{current_first}'\n")
+                    f.write(f"prev_first_word='{self._prev_first_word}'\n")
                 return
 
             for b in blocks:
