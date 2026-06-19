@@ -1358,6 +1358,7 @@ class ScreenTranslator(tk.Tk):
 
             if not blocks:
                 self._prev_first_word = None
+                print(f"[DIAG] No blocks extracted from OCR")
                 return
 
             all_text = " ".join(b["text"] for b in blocks)
@@ -1373,6 +1374,14 @@ class ScreenTranslator(tk.Tk):
                     b["is_table"] = _is_table_block(b, img)
                 else:
                     b["is_table"] = False
+
+            chart_count = sum(1 for b in blocks if b["is_chart"])
+            table_count = sum(1 for b in blocks if b["is_table"])
+            normal_count = len(blocks) - chart_count - table_count
+            print(f"[DIAG] Blocks: total={len(blocks)}, normal={normal_count}, chart={chart_count}, table={table_count}")
+            for i, b in enumerate(blocks):
+                status = "CHART" if b["is_chart"] else ("TABLE" if b["is_table"] else "OK")
+                print(f"[DIAG]   [{i}] {status} conf={b['median_conf']} text={b['text'][:60]!r}")
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
@@ -1407,7 +1416,9 @@ class ScreenTranslator(tk.Tk):
                     all_tasks.append((i, None, block_texts[i]))
 
             if not all_tasks:
+                print(f"[DIAG] All blocks skipped - no translation tasks")
                 return
+            print(f"[DIAG] Sending {len(all_tasks)} texts to DeepL")
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=4,
