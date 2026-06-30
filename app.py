@@ -43,6 +43,14 @@ TESS_LANG = "jpn+eng"
 CONF_THRESHOLD = 60
 SMALL_CHAR_PX = 14
 MAX_LLM_BLOCKS = 3
+
+# --- Ollama (local VLM) optimization ---
+OLLAMA_MODEL = "gemma3:4b"
+OLLAMA_KEEP_ALIVE = "10m"   # keep model resident in VRAM between scans
+OLLAMA_MAX_IMG = 1024       # downscale crops to this max dimension before sending
+OLLAMA_BLOCK_TOKENS = 256   # output cap for low-conf block re-OCR
+OLLAMA_TABLE_TOKENS = 1024  # output cap for table extraction
+OLLAMA_PARALLEL = 2         # concurrent block re-OCR requests
 # --- Phase 4: Chart detection & rendering ---
 ENABLE_CHART_DETECTION = True
 PROTECT_NUMERIC = True
@@ -1081,6 +1089,173 @@ def _cluster_line_positions(positions, gap=5):
     return clusters
 
 
+_ollama_ok = None
+
+def _ollama_available():
+    """Check if Ollama is running (cached after first check per session)."""
+    global _ollama_ok
+    if _ollama_ok is not None:
+        return _ollama_ok
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/tags", method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+        models = [m["name"] for m in tags.get("models", [])]
+        _ollama_ok = any("gemma3" in m for m in models)
+    except Exception:
+        _ollama_ok = False
+    return _ollama_ok
+
+
+def _ollama_warmup():
+    """Preload the model into VRAM in the background so the first real
+    request doesn't pay the load cost. Safe to call once at startup."""
+    if not _ollama_available():
+        return
+    try:
+        req_data = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": "",
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60):
+            pass
+    except Exception:
+        pass
+
+
+def _ollama_b64(pil_img):
+    """Downscale a crop to OLLAMA_MAX_IMG and return base64 PNG.
+
+    Smaller images mean far fewer vision tokens -> much faster inference."""
+    import base64
+    import io
+    img = pil_img.convert("RGB")
+    w, h = img.size
+    longest = max(w, h)
+    if longest > OLLAMA_MAX_IMG:
+        scale = OLLAMA_MAX_IMG / longest
+        img = img.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.LANCZOS,
+        )
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _ollama_generate(prompt, img_b64, timeout, num_predict):
+    """Single Ollama generate call with resident model and capped output.
+
+    Returns the response text, or None on failure."""
+    try:
+        req_data = json.dumps({
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "images": [img_b64],
+            "stream": False,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "options": {
+                "num_predict": num_predict,
+                "temperature": 0,
+            },
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+        return resp_data.get("response", "")
+    except Exception:
+        return None
+
+
+def _ollama_extract_table(img, table_region):
+    """Use Ollama vision model to extract table cell contents.
+
+    Returns list of (cx, cy, cw, ch, text) or None if Ollama unavailable.
+    """
+    if not _ollama_available():
+        return None
+
+    tx, ty, tw, th = table_region["bbox"]
+    iw, ih = img.size
+    crop = img.crop((max(0, tx), max(0, ty),
+                     min(iw, tx + tw), min(ih, ty + th)))
+    img_b64 = _ollama_b64(crop)
+
+    prompt = (
+        "This image shows a table. Extract ALL text content from each cell.\n"
+        "Return ONLY a JSON array of objects with these fields:\n"
+        '  "row": row index (0-based, top to bottom)\n'
+        '  "col": column index (0-based, left to right)\n'
+        '  "text": the text content of the cell\n'
+        "Rules:\n"
+        "- Include header rows (row 0 is usually the header)\n"
+        "- For cells with only numbers, currency, or percentages, "
+        "set text to the exact value as-is\n"
+        "- For empty cells, omit them\n"
+        "- Do NOT translate, just extract the original text\n"
+        "Return ONLY the JSON array, no other text."
+    )
+
+    response_text = _ollama_generate(
+        prompt, img_b64, timeout=30, num_predict=OLLAMA_TABLE_TOKENS,
+    )
+    if response_text is None:
+        return None
+    # Extract JSON from response
+    json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+    if not json_match:
+        return None
+    try:
+        cells_data = json.loads(json_match.group())
+    except Exception:
+        return None
+
+    if not cells_data or not isinstance(cells_data, list):
+        return None
+
+    # Map row/col to pixel positions using detected grid lines
+    h_lines = table_region.get("h_lines", [])
+    v_lines = table_region.get("v_lines", [])
+
+    if len(h_lines) < 2 or len(v_lines) < 2:
+        return None
+
+    result = []
+    for cell in cells_data:
+        if not isinstance(cell, dict):
+            continue
+        row = cell.get("row", -1)
+        col = cell.get("col", -1)
+        text = cell.get("text", "").strip()
+        if not text or row < 0 or col < 0:
+            continue
+        if row >= len(h_lines) - 1 or col >= len(v_lines) - 1:
+            continue
+        cx = v_lines[col] + 1
+        cy = h_lines[row] + 1
+        cw = v_lines[col + 1] - cx - 1
+        ch_px = h_lines[row + 1] - cy - 1
+        if cw > 5 and ch_px > 5:
+            result.append((cx, cy, cw, ch_px, text))
+
+    return result if result else None
+
+
 def _is_numeric_only(text):
     """Check if text is purely numeric/currency (no need to translate)."""
     cleaned = re.sub(r'[\s\$€¥£%,.\-+()trn\d]', '', text, flags=re.IGNORECASE)
@@ -1455,6 +1630,10 @@ class ScreenTranslator(tk.Tk):
 
         self.after(100, self._reposition_toolbar)
 
+        # Preload the Ollama model in the background so the first
+        # low-confidence / table scan doesn't pay the model-load cost.
+        threading.Thread(target=_ollama_warmup, daemon=True).start()
+
     def _reposition_toolbar(self):
         self.capture_frame.update_idletasks()
         fx = self.capture_frame.winfo_x()
@@ -1552,8 +1731,11 @@ class ScreenTranslator(tk.Tk):
             ocr_img = _preprocess_for_ocr(img)
             blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
-            # Refine low-confidence blocks using local GOT-OCR (if available)
-            blocks = self._refine_low_conf_blocks(blocks, img)
+            # Refine low-confidence blocks: prefer Ollama, fall back to GOT-OCR
+            if _ollama_available():
+                blocks = self._refine_with_ollama(blocks, img)
+            else:
+                blocks = self._refine_low_conf_blocks(blocks, img)
 
             if not blocks:
                 self._prev_first_word = None
@@ -1587,18 +1769,33 @@ class ScreenTranslator(tk.Tk):
             table_cell_data = []
             if table_regions:
                 for table in table_regions:
-                    # Per-cell Tesseract OCR
-                    cell_tasks = []
-                    for cx, cy, cw, ch in table["cells"]:
-                        cell_text = _ocr_cell(img, cx, cy, cw, ch)
-                        if cell_text and not _is_numeric_only(cell_text):
-                            cell_tasks.append(
-                                (cx, cy, cw, ch, cell_text)
-                            )
-                        elif cell_text:
-                            table_cell_data.append(
-                                (cx, cy, cw, ch, cell_text)
-                            )
+                    # Try Ollama VLM first
+                    ollama_cells = _ollama_extract_table(img, table)
+                    if ollama_cells:
+                        cell_tasks = [
+                            (cx, cy, cw, ch, text)
+                            for cx, cy, cw, ch, text in ollama_cells
+                            if not _is_numeric_only(text)
+                        ]
+                        # Keep numeric cells as-is (no translation)
+                        for cx, cy, cw, ch, text in ollama_cells:
+                            if _is_numeric_only(text):
+                                table_cell_data.append(
+                                    (cx, cy, cw, ch, text)
+                                )
+                    else:
+                        # Fallback: Tesseract per-cell OCR
+                        cell_tasks = []
+                        for cx, cy, cw, ch in table["cells"]:
+                            cell_text = _ocr_cell(img, cx, cy, cw, ch)
+                            if cell_text and not _is_numeric_only(cell_text):
+                                cell_tasks.append(
+                                    (cx, cy, cw, ch, cell_text)
+                                )
+                            elif cell_text:
+                                table_cell_data.append(
+                                    (cx, cy, cw, ch, cell_text)
+                                )
 
                     if cell_tasks:
                         with concurrent.futures.ThreadPoolExecutor(
@@ -1743,6 +1940,53 @@ class ScreenTranslator(tk.Tk):
 
         return blocks
 
+    def _refine_with_ollama(self, blocks, original_img):
+        """Re-OCR low confidence blocks using Ollama vision model.
+
+        Only the worst MAX_LLM_BLOCKS blocks are re-OCR'd, requests are run
+        concurrently, and the model stays resident (keep_alive)."""
+        if not _ollama_available():
+            return blocks
+
+        candidates = []
+        for i, b in enumerate(blocks):
+            if b["median_conf"] < CONF_THRESHOLD or b["median_char_h"] < SMALL_CHAR_PX:
+                candidates.append((i, b["median_conf"]))
+        candidates.sort(key=lambda x: x[1])
+        candidates = candidates[:MAX_LLM_BLOCKS]
+
+        if not candidates:
+            return blocks
+
+        prompt = (
+            "Extract ALL text from this image exactly as written. "
+            "Return ONLY the text, nothing else."
+        )
+        iw, ih = original_img.size
+
+        def _reocr(idx):
+            b = blocks[idx]
+            x, y, w, h = b["x"], b["y"], b["w"], b["h"]
+            crop = original_img.crop((
+                max(0, x), max(0, y),
+                min(iw, x + w), min(ih, y + h),
+            ))
+            img_b64 = _ollama_b64(crop)
+            result = _ollama_generate(
+                prompt, img_b64, timeout=15,
+                num_predict=OLLAMA_BLOCK_TOKENS,
+            )
+            return idx, (result.strip() if result else None)
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=OLLAMA_PARALLEL,
+        ) as pool:
+            for idx, result in pool.map(_reocr, [c[0] for c in candidates]):
+                if result and len(result) > 1:
+                    blocks[idx]["text"] = result
+
+        return blocks
+
     def _on_close(self):
         self.running = False
         self.overlay.destroy()
@@ -1797,6 +2041,24 @@ def _run_diagnostics():
             lines.append("[--] VLM re-OCR: disabled (torch not installed)")
     except ImportError:
         lines.append("[--] VLM re-OCR: disabled (local_ocr.py not found)")
+
+    # Ollama
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/tags",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+        models = [m["name"] for m in tags.get("models", [])]
+        has_vision = any("gemma3" in m for m in models)
+        lines.append(f"[OK] Ollama: running ({len(models)} models)")
+        if has_vision:
+            lines.append("[OK] Ollama vision: gemma3 available")
+        else:
+            lines.append("[--] Ollama vision: gemma3 not found (run: ollama pull gemma3:4b)")
+    except Exception:
+        lines.append("[--] Ollama: not running")
 
     # DeepL
     api_key = _load_api_key()
