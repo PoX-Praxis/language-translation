@@ -1137,7 +1137,7 @@ def _ollama_extract_table(img, table_region):
 
     try:
         req_data = json.dumps({
-            "model": "gemma3:12b",
+            "model": "gemma3:4b",
             "prompt": prompt,
             "images": [img_b64],
             "stream": False,
@@ -1903,7 +1903,7 @@ class ScreenTranslator(tk.Tk):
 
             try:
                 req_data = json.dumps({
-                    "model": "gemma3:12b",
+                    "model": "gemma3:4b",
                     "prompt": "Extract ALL text from this image exactly as written. Return ONLY the text, nothing else.",
                     "images": [img_b64],
                     "stream": False,
@@ -1993,7 +1993,7 @@ def _run_diagnostics():
         if has_vision:
             lines.append("[OK] Ollama vision: gemma3 available")
         else:
-            lines.append("[--] Ollama vision: gemma3 not found (run: ollama pull gemma3:12b)")
+            lines.append("[--] Ollama vision: gemma3 not found (run: ollama pull gemma3:4b)")
     except Exception:
         lines.append("[--] Ollama: not running")
 
