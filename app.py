@@ -28,6 +28,34 @@ import pytesseract
 APP_NAME = "Screen Translator"
 APP_VERSION = "1.2.0"
 
+# Set to False to silence per-stage timing output on the console.
+TIMING = True
+
+
+class _Timer:
+    """Lightweight stage timer that prints elapsed seconds to the console."""
+
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.last = self.t0
+        self.marks = []
+
+    def mark(self, label):
+        now = time.perf_counter()
+        self.marks.append((label, now - self.last))
+        self.last = now
+
+    def report(self, tag):
+        if not TIMING:
+            self.marks = []
+            self.t0 = self.last
+            return
+        total = self.last - self.t0
+        parts = " ".join(f"{lbl}={dt:.2f}s" for lbl, dt in self.marks)
+        print(f"[TIMING] {tag} total={total:.2f}s | {parts}", flush=True)
+        self.marks = []
+        self.t0 = self.last
+
 # ---------------------------------------------------------------------------
 # OCR settings (all tunable constants)
 # ---------------------------------------------------------------------------
@@ -1774,6 +1802,7 @@ class ScreenTranslator(tk.Tk):
     def _scan_and_translate(self):
         if not self._lock.acquire(blocking=False):
             return
+        t = _Timer()
         try:
             region = self.capture_frame.get_inner_region()
             with mss.mss() as sct:
@@ -1781,9 +1810,12 @@ class ScreenTranslator(tk.Tk):
             img = Image.frombytes(
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX",
             )
+            t.mark("grab")
 
             ocr_img = _preprocess_for_ocr(img)
+            t.mark("preprocess")
             blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
+            t.mark(f"tesseract_ocr(blocks={len(blocks)})")
 
             if not blocks:
                 self._prev_first_word = None
@@ -1798,6 +1830,7 @@ class ScreenTranslator(tk.Tk):
 
             # Detect table regions in the image
             table_regions = _detect_table_regions(img)
+            t.mark(f"table_detect(tables={len(table_regions)})")
 
             for b in blocks:
                 b["is_chart"] = _is_chart_block(b, img)
@@ -1808,6 +1841,7 @@ class ScreenTranslator(tk.Tk):
                         b["is_table"] = _is_table_block(b, img)
                 else:
                     b["is_table"] = False
+            t.mark("classify")
 
             target_code = LANG_OPTIONS.get(
                 self.toolbar.lang_var.get(), "en",
@@ -1818,7 +1852,9 @@ class ScreenTranslator(tk.Tk):
             table_cell_data = self._translate_table_cells_tesseract(
                 img, table_regions, target_code,
             )
+            t.mark("table_cells_tess")
             translations = self._translate_blocks(blocks, target_code)
+            t.mark("deepl_translate")
 
             if not any(translations) and not table_cell_data:
                 return
@@ -1827,6 +1863,8 @@ class ScreenTranslator(tk.Tk):
             self._publish_render(
                 img, blocks, translations, table_cell_data, region,
             )
+            t.mark("render_pass1")
+            t.report("PASS1")
 
             # ===== PASS 2: refine with Ollama VLM in the background =====
             # Runs after the fast result is already on screen, so the heavy
@@ -1839,6 +1877,7 @@ class ScreenTranslator(tk.Tk):
             # Refine low-confidence blocks, then re-translate any that changed.
             pre_texts = [b["text"] for b in blocks]
             blocks = self._refine_with_ollama(blocks, img)
+            t.mark("ollama_blocks")
             if [b["text"] for b in blocks] != pre_texts:
                 translations = self._translate_blocks(blocks, target_code)
                 changed = True
@@ -1851,11 +1890,13 @@ class ScreenTranslator(tk.Tk):
                 if vlm_cells:
                     table_cell_data = vlm_cells
                     changed = True
+            t.mark("ollama_tables")
 
             if changed:
                 self._publish_render(
                     img, blocks, translations, table_cell_data, region,
                 )
+            t.report("PASS2")
         except Exception:
             traceback.print_exc()
         finally:
