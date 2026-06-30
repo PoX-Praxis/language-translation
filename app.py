@@ -10,8 +10,10 @@ import concurrent.futures
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import traceback
@@ -1109,6 +1111,55 @@ def _ollama_available():
     return _ollama_ok
 
 
+def _ollama_server_up(timeout=2):
+    """True if the Ollama HTTP server responds (regardless of model)."""
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/tags", method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _ollama_start_server():
+    """Launch `ollama serve` in the background if it isn't already running.
+
+    Returns True once the server responds. Does nothing (returns False) if
+    the ollama binary isn't installed / not on PATH."""
+    if _ollama_server_up():
+        return True
+    try:
+        kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            # CREATE_NO_WINDOW: don't pop up a console window
+            kwargs["creationflags"] = 0x08000000
+        subprocess.Popen(["ollama", "serve"], **kwargs)
+    except (FileNotFoundError, OSError):
+        return False
+    # Wait for the server to accept connections (up to ~15s)
+    for _ in range(30):
+        if _ollama_server_up():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _ollama_startup():
+    """Start the Ollama server (if needed) and preload the model.
+
+    Intended to run once, in a background thread, when the app launches."""
+    global _ollama_ok
+    _ollama_start_server()
+    # Re-evaluate availability now that the server may have just started.
+    _ollama_ok = None
+    _ollama_warmup()
+
+
 def _ollama_warmup():
     """Preload the model into VRAM in the background so the first real
     request doesn't pay the load cost. Safe to call once at startup."""
@@ -1630,9 +1681,9 @@ class ScreenTranslator(tk.Tk):
 
         self.after(100, self._reposition_toolbar)
 
-        # Preload the Ollama model in the background so the first
-        # low-confidence / table scan doesn't pay the model-load cost.
-        threading.Thread(target=_ollama_warmup, daemon=True).start()
+        # Start the Ollama server (if installed) and preload the model in
+        # the background, so the first low-confidence / table scan is fast.
+        threading.Thread(target=_ollama_startup, daemon=True).start()
 
     def _reposition_toolbar(self):
         self.capture_frame.update_idletasks()
