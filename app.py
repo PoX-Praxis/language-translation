@@ -35,6 +35,7 @@ APP_VERSION = "1.2.0"
 # --- Phase 1: Image preprocessing ---
 OCR_UPSCALE = 2.5
 OCR_CONTRAST = 1.6
+OCR_DARK_BG_MEAN = 110   # below this average gray, treat page as dark -> invert
 
 # --- Phase 2: Tesseract config ---
 TESS_PSM = 3    # 3=auto, 6=single block, 11=sparse text
@@ -300,17 +301,19 @@ def _preprocess_for_ocr(pil_img):
     upscaled = pil_img.resize((new_w, new_h), Image.LANCZOS)
 
     gray = upscaled.convert("L")
-
     enhanced = ImageEnhance.Contrast(gray).enhance(OCR_CONTRAST)
 
     arr = np.array(enhanced)
-    thresh = _otsu_threshold(arr)
-    binary = ((arr > thresh) * 255).astype(np.uint8)
 
-    if np.mean(binary) < 128:
-        binary = 255 - binary
+    # Feed GRAYSCALE (not hard-binarized) to Tesseract: the LSTM engine does
+    # its own adaptive thresholding internally and recognizes far more text
+    # on colored / low-contrast / gradient backgrounds than a single global
+    # Otsu threshold would survive. We only flip dark pages so text ends up
+    # dark-on-light, which Tesseract handles best.
+    if np.mean(arr) < OCR_DARK_BG_MEAN:
+        arr = 255 - arr
 
-    return Image.fromarray(binary)
+    return Image.fromarray(arr)
 
 
 def _region_colors(img, x, y, w, h):
@@ -1782,12 +1785,6 @@ class ScreenTranslator(tk.Tk):
             ocr_img = _preprocess_for_ocr(img)
             blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
-            # Refine low-confidence blocks: prefer Ollama, fall back to GOT-OCR
-            if _ollama_available():
-                blocks = self._refine_with_ollama(blocks, img)
-            else:
-                blocks = self._refine_low_conf_blocks(blocks, img)
-
             if not blocks:
                 self._prev_first_word = None
                 return
@@ -1816,145 +1813,185 @@ class ScreenTranslator(tk.Tk):
                 self.toolbar.lang_var.get(), "en",
             )
 
-            # --- Table cell translation ---
-            table_cell_data = []
-            if table_regions:
-                for table in table_regions:
-                    # Try Ollama VLM first
-                    ollama_cells = _ollama_extract_table(img, table)
-                    if ollama_cells:
-                        cell_tasks = [
-                            (cx, cy, cw, ch, text)
-                            for cx, cy, cw, ch, text in ollama_cells
-                            if not _is_numeric_only(text)
-                        ]
-                        # Keep numeric cells as-is (no translation)
-                        for cx, cy, cw, ch, text in ollama_cells:
-                            if _is_numeric_only(text):
-                                table_cell_data.append(
-                                    (cx, cy, cw, ch, text)
-                                )
-                    else:
-                        # Fallback: Tesseract per-cell OCR
-                        cell_tasks = []
-                        for cx, cy, cw, ch in table["cells"]:
-                            cell_text = _ocr_cell(img, cx, cy, cw, ch)
-                            if cell_text and not _is_numeric_only(cell_text):
-                                cell_tasks.append(
-                                    (cx, cy, cw, ch, cell_text)
-                                )
-                            elif cell_text:
-                                table_cell_data.append(
-                                    (cx, cy, cw, ch, cell_text)
-                                )
+            # ===== PASS 1: fast Tesseract-only translation (no VLM) =====
+            # Show a result immediately so the user never waits on the VLM.
+            table_cell_data = self._translate_table_cells_tesseract(
+                img, table_regions, target_code,
+            )
+            translations = self._translate_blocks(blocks, target_code)
 
-                    if cell_tasks:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=4,
-                        ) as pool:
-                            cell_futures = [
-                                pool.submit(
-                                    self._engine.translate, ct[4],
-                                    target_code,
-                                )
-                                for ct in cell_tasks
-                            ]
-                            cell_results = [
-                                f.result()[0] for f in cell_futures
-                            ]
-                        for (cx, cy, cw, ch, _src), translated in zip(
-                            cell_tasks, cell_results,
-                        ):
-                            table_cell_data.append(
-                                (cx, cy, cw, ch, translated)
-                            )
-
-            # --- Normal text translation ---
-            block_texts = []
-            placeholder_maps = []
-            for b in blocks:
-                text = b["text"]
-                if PROTECT_NUMERIC:
-                    text, pmap = _protect_numerics(text)
-                else:
-                    pmap = {}
-                block_texts.append(text)
-                placeholder_maps.append(pmap)
-
-            all_tasks = []
-            for i, b in enumerate(blocks):
-                if b.get("is_chart") or b.get("is_table"):
-                    continue
-                if b.get("is_toc") and b.get("toc_pages"):
-                    headings = block_texts[i].split("\n")
-                    for si, h in enumerate(headings):
-                        h = h.strip()
-                        if h:
-                            words = h.split()
-                            if len(words) >= 2 and all(len(w) <= 4 for w in words):
-                                h = "".join(words)
-                            all_tasks.append((i, si, h))
-                else:
-                    all_tasks.append((i, None, block_texts[i]))
-
-            if not all_tasks and not table_cell_data:
+            if not any(translations) and not table_cell_data:
                 return
 
-            translations = [""] * len(blocks)
-            if all_tasks:
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=4,
-                ) as pool:
-                    futures = [
-                        pool.submit(
-                            self._engine.translate, task[2], target_code,
-                        )
-                        for task in all_tasks
-                    ]
-                    results = [f.result()[0] for f in futures]
-
-                toc_heading_map = {}
-                for (bi, si, _), translated in zip(all_tasks, results):
-                    if si is None:
-                        translations[bi] = translated
-                    else:
-                        toc_heading_map.setdefault(bi, [])
-                        toc_heading_map[bi].append(translated)
-                for bi, heads in toc_heading_map.items():
-                    translations[bi] = "\n".join(heads)
-
-            if PROTECT_NUMERIC:
-                translations = [
-                    _restore_numerics(t, pm)
-                    for t, pm in zip(translations, placeholder_maps)
-                ]
-
             self._prev_first_word = current_first
-
-            scale_pct = self.toolbar.fontsize_pct
-            w, h = region["width"], region["height"]
-            rx, ry = region["left"], region["top"]
-            result_img = _render_inplace(
-                img, blocks, translations, scale_pct,
-                table_cell_data=table_cell_data,
+            self._publish_render(
+                img, blocks, translations, table_cell_data, region,
             )
 
-            self._last_render = {
-                "img": img, "blocks": blocks,
-                "translations": translations,
-                "table_cell_data": table_cell_data,
-                "x": rx, "y": ry, "w": w, "h": h,
-            }
+            # ===== PASS 2: refine with Ollama VLM in the background =====
+            # Runs after the fast result is already on screen, so the heavy
+            # (GPU/CPU) inference never blocks what the user sees.
+            if not _ollama_available():
+                return
 
-            self.after(
-                0,
-                self.overlay.show_at,
-                rx, ry, w, h, result_img,
-            )
-        except Exception as e:
+            changed = False
+
+            # Refine low-confidence blocks, then re-translate any that changed.
+            pre_texts = [b["text"] for b in blocks]
+            blocks = self._refine_with_ollama(blocks, img)
+            if [b["text"] for b in blocks] != pre_texts:
+                translations = self._translate_blocks(blocks, target_code)
+                changed = True
+
+            # Refine table cells via VLM structure extraction.
+            if table_regions:
+                vlm_cells = self._translate_table_cells_ollama(
+                    img, table_regions, target_code,
+                )
+                if vlm_cells:
+                    table_cell_data = vlm_cells
+                    changed = True
+
+            if changed:
+                self._publish_render(
+                    img, blocks, translations, table_cell_data, region,
+                )
+        except Exception:
             traceback.print_exc()
         finally:
             self._lock.release()
+
+    def _publish_render(self, img, blocks, translations, table_cell_data,
+                        region):
+        """Render the overlay image and push it to the UI thread."""
+        scale_pct = self.toolbar.fontsize_pct
+        w, h = region["width"], region["height"]
+        rx, ry = region["left"], region["top"]
+        result_img = _render_inplace(
+            img, blocks, translations, scale_pct,
+            table_cell_data=table_cell_data,
+        )
+        self._last_render = {
+            "img": img, "blocks": blocks,
+            "translations": translations,
+            "table_cell_data": table_cell_data,
+            "x": rx, "y": ry, "w": w, "h": h,
+        }
+        self.after(0, self.overlay.show_at, rx, ry, w, h, result_img)
+
+    def _translate_blocks(self, blocks, target_code):
+        """Translate all non-chart/table blocks. Returns a list aligned to
+        blocks (TOC blocks get their headings joined with newlines)."""
+        block_texts = []
+        placeholder_maps = []
+        for b in blocks:
+            text = b["text"]
+            if PROTECT_NUMERIC:
+                text, pmap = _protect_numerics(text)
+            else:
+                pmap = {}
+            block_texts.append(text)
+            placeholder_maps.append(pmap)
+
+        all_tasks = []
+        for i, b in enumerate(blocks):
+            if b.get("is_chart") or b.get("is_table"):
+                continue
+            if b.get("is_toc") and b.get("toc_pages"):
+                headings = block_texts[i].split("\n")
+                for si, h in enumerate(headings):
+                    h = h.strip()
+                    if h:
+                        words = h.split()
+                        if len(words) >= 2 and all(len(w) <= 4 for w in words):
+                            h = "".join(words)
+                        all_tasks.append((i, si, h))
+            else:
+                all_tasks.append((i, None, block_texts[i]))
+
+        translations = [""] * len(blocks)
+        if all_tasks:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=4,
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        self._engine.translate, task[2], target_code,
+                    )
+                    for task in all_tasks
+                ]
+                results = [f.result()[0] for f in futures]
+
+            toc_heading_map = {}
+            for (bi, si, _), translated in zip(all_tasks, results):
+                if si is None:
+                    translations[bi] = translated
+                else:
+                    toc_heading_map.setdefault(bi, [])
+                    toc_heading_map[bi].append(translated)
+            for bi, heads in toc_heading_map.items():
+                translations[bi] = "\n".join(heads)
+
+        if PROTECT_NUMERIC:
+            translations = [
+                _restore_numerics(t, pm)
+                for t, pm in zip(translations, placeholder_maps)
+            ]
+        return translations
+
+    def _translate_table_cells_tesseract(self, img, table_regions,
+                                         target_code):
+        """Per-cell Tesseract OCR + translation for all tables (fast path)."""
+        table_cell_data = []
+        if not table_regions:
+            return table_cell_data
+        for table in table_regions:
+            cell_tasks = []
+            for cx, cy, cw, ch in table["cells"]:
+                cell_text = _ocr_cell(img, cx, cy, cw, ch)
+                if cell_text and not _is_numeric_only(cell_text):
+                    cell_tasks.append((cx, cy, cw, ch, cell_text))
+                elif cell_text:
+                    table_cell_data.append((cx, cy, cw, ch, cell_text))
+            table_cell_data.extend(
+                self._translate_cells_to(cell_tasks, target_code)
+            )
+        return table_cell_data
+
+    def _translate_table_cells_ollama(self, img, table_regions, target_code):
+        """VLM structure extraction + translation for all tables (refine)."""
+        table_cell_data = []
+        got_any = False
+        for table in table_regions:
+            ollama_cells = _ollama_extract_table(img, table)
+            if not ollama_cells:
+                continue
+            got_any = True
+            cell_tasks = []
+            for cx, cy, cw, ch, text in ollama_cells:
+                if _is_numeric_only(text):
+                    table_cell_data.append((cx, cy, cw, ch, text))
+                else:
+                    cell_tasks.append((cx, cy, cw, ch, text))
+            table_cell_data.extend(
+                self._translate_cells_to(cell_tasks, target_code)
+            )
+        return table_cell_data if got_any else None
+
+    def _translate_cells_to(self, cell_tasks, target_code):
+        """Translate (cx, cy, cw, ch, text) cells -> translated tuples."""
+        if not cell_tasks:
+            return []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(self._engine.translate, ct[4], target_code)
+                for ct in cell_tasks
+            ]
+            results = [f.result()[0] for f in futures]
+        return [
+            (cx, cy, cw, ch, translated)
+            for (cx, cy, cw, ch, _src), translated in zip(cell_tasks, results)
+        ]
 
     def _refine_low_conf_blocks(self, blocks, original_img):
         try:
