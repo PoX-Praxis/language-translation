@@ -256,12 +256,66 @@ class DeepLEngine:
             self._cache[cache_key] = result
         return result
 
+    def translate_batch(self, texts, target_code):
+        """Translate many texts in as few requests as possible.
+
+        DeepL accepts up to 50 `text` fields per request, so a page of 12-19
+        blocks becomes a single round-trip instead of one call per block."""
+        if not self.api_key:
+            raise RuntimeError("DeepL API key is not set")
+
+        results = [None] * len(texts)
+        to_fetch = []  # list of (index, text) not already cached
+        for i, text in enumerate(texts):
+            cache_key = (text, target_code)
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+            if cached is not None:
+                results[i] = cached
+            else:
+                to_fetch.append((i, text))
+
+        if to_fetch:
+            deepl_code = DEEPL_LANG_MAP.get(target_code, target_code.upper())
+            is_free = self.api_key.endswith(":fx")
+            url = self._FREE_URL if is_free else self._PRO_URL
+            for start in range(0, len(to_fetch), 50):
+                chunk = to_fetch[start:start + 50]
+                params = [("target_lang", deepl_code)]
+                params.extend(("text", text) for _, text in chunk)
+                data = urllib.parse.urlencode(params).encode("utf-8")
+                req = urllib.request.Request(
+                    url, data=data,
+                    headers={
+                        "Authorization": f"DeepL-Auth-Key {self.api_key}",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                trans = body.get("translations", [])
+                for (idx, text), tr in zip(chunk, trans):
+                    res = (
+                        tr["text"],
+                        tr.get("detected_source_language", "auto").lower(),
+                    )
+                    results[idx] = res
+                    with self._cache_lock:
+                        self._cache[(text, target_code)] = res
+
+        # Any leftover (e.g. mismatched response length) -> empty string.
+        return [r if r is not None else ("", "auto") for r in results]
+
 
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
 
-def _find_system_font(size=16):
+_FONT_PATH = None       # resolved once (disk search is expensive)
+_FONT_PATH_DONE = False
+_FONT_CACHE = {}        # size -> ImageFont, so the render shrink loop is cheap
+
+
+def _resolve_font_path():
     if sys.platform == "win32":
         font_dirs = [
             os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
@@ -287,14 +341,35 @@ def _find_system_font(size=16):
             for font_dir in font_dirs:
                 path = os.path.join(font_dir, font_file)
                 if os.path.exists(path):
-                    try:
-                        return ImageFont.truetype(path, size)
-                    except Exception:
-                        continue
-    try:
-        return ImageFont.truetype("arial.ttf", size)
-    except Exception:
-        return ImageFont.load_default()
+                    return path
+    return None
+
+
+def _find_system_font(size=16):
+    global _FONT_PATH, _FONT_PATH_DONE
+    size = int(size)
+    cached = _FONT_CACHE.get(size)
+    if cached is not None:
+        return cached
+
+    if not _FONT_PATH_DONE:
+        _FONT_PATH = _resolve_font_path()
+        _FONT_PATH_DONE = True
+
+    font = None
+    if _FONT_PATH:
+        try:
+            font = ImageFont.truetype(_FONT_PATH, size)
+        except Exception:
+            font = None
+    if font is None:
+        try:
+            font = ImageFont.truetype("arial.ttf", size)
+        except Exception:
+            font = ImageFont.load_default()
+
+    _FONT_CACHE[size] = font
+    return font
 
 
 def _otsu_threshold(gray_arr):
@@ -1693,6 +1768,8 @@ class ScreenTranslator(tk.Tk):
         self._lock = threading.Lock()
         self._prev_first_word = None
         self._last_render = None
+        self._gen = 0          # bumped each scan; PASS2 abandons if superseded
+        self._closing = False
 
         self.capture_frame = CaptureFrame(self)
         self.overlay = TranslationOverlay(self, on_click=self._on_overlay_click)
@@ -1802,7 +1879,10 @@ class ScreenTranslator(tk.Tk):
     def _scan_and_translate(self):
         if not self._lock.acquire(blocking=False):
             return
+        self._gen += 1
+        my_gen = self._gen
         t = _Timer()
+        pass2_ctx = None
         try:
             region = self.capture_frame.get_inner_region()
             with mss.mss() as sct:
@@ -1866,15 +1946,29 @@ class ScreenTranslator(tk.Tk):
             t.mark("render_pass1")
             t.report("PASS1")
 
-            # ===== PASS 2: refine with Ollama VLM in the background =====
-            # Runs after the fast result is already on screen, so the heavy
-            # (GPU/CPU) inference never blocks what the user sees.
-            if not _ollama_available():
-                return
+            # Hand the data to PASS 2, which runs *after* the lock is
+            # released so the slow VLM never blocks the next translation.
+            if _ollama_available():
+                pass2_ctx = (
+                    img, blocks, table_regions, target_code, region,
+                    translations, table_cell_data,
+                )
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self._lock.release()
 
+        # ===== PASS 2: refine with Ollama VLM (lock-free, background) =====
+        # The fast result is already on screen. This runs without the lock,
+        # and abandons itself if a newer scan has started (generation guard)
+        # or the app is closing.
+        if pass2_ctx is None or self._closing or my_gen != self._gen:
+            return
+        (img, blocks, table_regions, target_code, region,
+         translations, table_cell_data) = pass2_ctx
+        try:
             changed = False
 
-            # Refine low-confidence blocks, then re-translate any that changed.
             pre_texts = [b["text"] for b in blocks]
             blocks = self._refine_with_ollama(blocks, img)
             t.mark("ollama_blocks")
@@ -1882,7 +1976,6 @@ class ScreenTranslator(tk.Tk):
                 translations = self._translate_blocks(blocks, target_code)
                 changed = True
 
-            # Refine table cells via VLM structure extraction.
             if table_regions:
                 vlm_cells = self._translate_table_cells_ollama(
                     img, table_regions, target_code,
@@ -1892,15 +1985,14 @@ class ScreenTranslator(tk.Tk):
                     changed = True
             t.mark("ollama_tables")
 
-            if changed:
+            # Only paint if still the most recent scan and not shutting down.
+            if changed and my_gen == self._gen and not self._closing:
                 self._publish_render(
                     img, blocks, translations, table_cell_data, region,
                 )
             t.report("PASS2")
         except Exception:
             traceback.print_exc()
-        finally:
-            self._lock.release()
 
     def _publish_render(self, img, blocks, translations, table_cell_data,
                         region):
@@ -1952,16 +2044,11 @@ class ScreenTranslator(tk.Tk):
 
         translations = [""] * len(blocks)
         if all_tasks:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=4,
-            ) as pool:
-                futures = [
-                    pool.submit(
-                        self._engine.translate, task[2], target_code,
-                    )
-                    for task in all_tasks
-                ]
-                results = [f.result()[0] for f in futures]
+            results = [
+                r[0] for r in self._engine.translate_batch(
+                    [task[2] for task in all_tasks], target_code,
+                )
+            ]
 
             toc_heading_map = {}
             for (bi, si, _), translated in zip(all_tasks, results):
@@ -2023,12 +2110,11 @@ class ScreenTranslator(tk.Tk):
         """Translate (cx, cy, cw, ch, text) cells -> translated tuples."""
         if not cell_tasks:
             return []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = [
-                pool.submit(self._engine.translate, ct[4], target_code)
-                for ct in cell_tasks
-            ]
-            results = [f.result()[0] for f in futures]
+        results = [
+            r[0] for r in self._engine.translate_batch(
+                [ct[4] for ct in cell_tasks], target_code,
+            )
+        ]
         return [
             (cx, cy, cw, ch, translated)
             for (cx, cy, cw, ch, _src), translated in zip(cell_tasks, results)
@@ -2118,6 +2204,7 @@ class ScreenTranslator(tk.Tk):
 
     def _on_close(self):
         self.running = False
+        self._closing = True
         self.overlay.destroy()
         self.capture_frame.destroy()
         self.toolbar.destroy()
