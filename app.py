@@ -1081,117 +1081,6 @@ def _cluster_line_positions(positions, gap=5):
     return clusters
 
 
-_ollama_ok = None
-
-def _ollama_available():
-    """Check if Ollama is running (cached after first check per session)."""
-    global _ollama_ok
-    if _ollama_ok is not None:
-        return _ollama_ok
-    try:
-        req = urllib.request.Request(
-            "http://localhost:11434/api/tags", method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            tags = json.loads(resp.read().decode("utf-8"))
-        models = [m["name"] for m in tags.get("models", [])]
-        _ollama_ok = any("gemma3" in m for m in models)
-    except Exception:
-        _ollama_ok = False
-    return _ollama_ok
-
-
-def _ollama_extract_table(img, table_region):
-    """Use Ollama vision model to extract table cell contents.
-
-    Returns list of (cx, cy, cw, ch, text) or None if Ollama unavailable.
-    """
-    if not _ollama_available():
-        return None
-    import base64
-    import io
-
-    tx, ty, tw, th = table_region["bbox"]
-    iw, ih = img.size
-    crop = img.crop((max(0, tx), max(0, ty),
-                     min(iw, tx + tw), min(ih, ty + th)))
-
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-    prompt = (
-        "This image shows a table. Extract ALL text content from each cell.\n"
-        "Return ONLY a JSON array of objects with these fields:\n"
-        '  "row": row index (0-based, top to bottom)\n'
-        '  "col": column index (0-based, left to right)\n'
-        '  "text": the text content of the cell\n'
-        "Rules:\n"
-        "- Include header rows (row 0 is usually the header)\n"
-        "- For cells with only numbers, currency, or percentages, "
-        "set text to the exact value as-is\n"
-        "- For empty cells, omit them\n"
-        "- Do NOT translate, just extract the original text\n"
-        "Return ONLY the JSON array, no other text."
-    )
-
-    try:
-        req_data = json.dumps({
-            "model": "gemma3:4b",
-            "prompt": prompt,
-            "images": [img_b64],
-            "stream": False,
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            "http://localhost:11434/api/generate",
-            data=req_data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-
-        response_text = resp_data.get("response", "")
-        # Extract JSON from response
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if not json_match:
-            return None
-        cells_data = json.loads(json_match.group())
-    except Exception:
-        return None
-
-    if not cells_data or not isinstance(cells_data, list):
-        return None
-
-    # Map row/col to pixel positions using detected grid lines
-    h_lines = table_region.get("h_lines", [])
-    v_lines = table_region.get("v_lines", [])
-
-    if len(h_lines) < 2 or len(v_lines) < 2:
-        return None
-
-    result = []
-    for cell in cells_data:
-        if not isinstance(cell, dict):
-            continue
-        row = cell.get("row", -1)
-        col = cell.get("col", -1)
-        text = cell.get("text", "").strip()
-        if not text or row < 0 or col < 0:
-            continue
-        if row >= len(h_lines) - 1 or col >= len(v_lines) - 1:
-            continue
-        cx = v_lines[col] + 1
-        cy = h_lines[row] + 1
-        cw = v_lines[col + 1] - cx - 1
-        ch_px = h_lines[row + 1] - cy - 1
-        if cw > 5 and ch_px > 5:
-            result.append((cx, cy, cw, ch_px, text))
-
-    return result if result else None
-
-
 def _is_numeric_only(text):
     """Check if text is purely numeric/currency (no need to translate)."""
     cleaned = re.sub(r'[\s\$€¥£%,.\-+()trn\d]', '', text, flags=re.IGNORECASE)
@@ -1663,11 +1552,8 @@ class ScreenTranslator(tk.Tk):
             ocr_img = _preprocess_for_ocr(img)
             blocks = _extract_text_blocks(ocr_img, scale=OCR_UPSCALE)
 
-            # Refine low-confidence blocks: prefer Ollama, fall back to GOT-OCR
-            if _ollama_available():
-                blocks = self._refine_with_ollama(blocks, img)
-            else:
-                blocks = self._refine_low_conf_blocks(blocks, img)
+            # Refine low-confidence blocks using local GOT-OCR (if available)
+            blocks = self._refine_low_conf_blocks(blocks, img)
 
             if not blocks:
                 self._prev_first_word = None
@@ -1701,33 +1587,18 @@ class ScreenTranslator(tk.Tk):
             table_cell_data = []
             if table_regions:
                 for table in table_regions:
-                    # Try Ollama VLM first
-                    ollama_cells = _ollama_extract_table(img, table)
-                    if ollama_cells:
-                        cell_tasks = [
-                            (cx, cy, cw, ch, text)
-                            for cx, cy, cw, ch, text in ollama_cells
-                            if not _is_numeric_only(text)
-                        ]
-                        # Keep numeric cells as-is (no translation)
-                        for cx, cy, cw, ch, text in ollama_cells:
-                            if _is_numeric_only(text):
-                                table_cell_data.append(
-                                    (cx, cy, cw, ch, text)
-                                )
-                    else:
-                        # Fallback: Tesseract per-cell OCR
-                        cell_tasks = []
-                        for cx, cy, cw, ch in table["cells"]:
-                            cell_text = _ocr_cell(img, cx, cy, cw, ch)
-                            if cell_text and not _is_numeric_only(cell_text):
-                                cell_tasks.append(
-                                    (cx, cy, cw, ch, cell_text)
-                                )
-                            elif cell_text:
-                                table_cell_data.append(
-                                    (cx, cy, cw, ch, cell_text)
-                                )
+                    # Per-cell Tesseract OCR
+                    cell_tasks = []
+                    for cx, cy, cw, ch in table["cells"]:
+                        cell_text = _ocr_cell(img, cx, cy, cw, ch)
+                        if cell_text and not _is_numeric_only(cell_text):
+                            cell_tasks.append(
+                                (cx, cy, cw, ch, cell_text)
+                            )
+                        elif cell_text:
+                            table_cell_data.append(
+                                (cx, cy, cw, ch, cell_text)
+                            )
 
                     if cell_tasks:
                         with concurrent.futures.ThreadPoolExecutor(
@@ -1872,58 +1743,6 @@ class ScreenTranslator(tk.Tk):
 
         return blocks
 
-    def _refine_with_ollama(self, blocks, original_img):
-        """Re-OCR low confidence blocks using Ollama vision model."""
-        if not _ollama_available():
-            return blocks
-        import base64
-        import io
-
-        candidates = []
-        for i, b in enumerate(blocks):
-            if b["median_conf"] < CONF_THRESHOLD or b["median_char_h"] < SMALL_CHAR_PX:
-                candidates.append((i, b["median_conf"]))
-        candidates.sort(key=lambda x: x[1])
-        candidates = candidates[:MAX_LLM_BLOCKS]
-
-        if not candidates:
-            return blocks
-
-        for idx, _ in candidates:
-            b = blocks[idx]
-            x, y, w, h = b["x"], b["y"], b["w"], b["h"]
-            iw, ih = original_img.size
-            crop = original_img.crop((
-                max(0, x), max(0, y),
-                min(iw, x + w), min(ih, y + h),
-            ))
-            buf = io.BytesIO()
-            crop.save(buf, format="PNG")
-            img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-            try:
-                req_data = json.dumps({
-                    "model": "gemma3:4b",
-                    "prompt": "Extract ALL text from this image exactly as written. Return ONLY the text, nothing else.",
-                    "images": [img_b64],
-                    "stream": False,
-                }).encode("utf-8")
-                req = urllib.request.Request(
-                    "http://localhost:11434/api/generate",
-                    data=req_data,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    resp_data = json.loads(resp.read().decode("utf-8"))
-                result = resp_data.get("response", "").strip()
-                if result and len(result) > 1:
-                    blocks[idx]["text"] = result
-            except Exception:
-                pass
-
-        return blocks
-
     def _on_close(self):
         self.running = False
         self.overlay.destroy()
@@ -1978,24 +1797,6 @@ def _run_diagnostics():
             lines.append("[--] VLM re-OCR: disabled (torch not installed)")
     except ImportError:
         lines.append("[--] VLM re-OCR: disabled (local_ocr.py not found)")
-
-    # Ollama
-    try:
-        req = urllib.request.Request(
-            "http://localhost:11434/api/tags",
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            tags = json.loads(resp.read().decode("utf-8"))
-        models = [m["name"] for m in tags.get("models", [])]
-        has_vision = any("gemma3" in m for m in models)
-        lines.append(f"[OK] Ollama: running ({len(models)} models)")
-        if has_vision:
-            lines.append("[OK] Ollama vision: gemma3 available")
-        else:
-            lines.append("[--] Ollama vision: gemma3 not found (run: ollama pull gemma3:4b)")
-    except Exception:
-        lines.append("[--] Ollama: not running")
 
     # DeepL
     api_key = _load_api_key()
